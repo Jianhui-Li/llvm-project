@@ -332,12 +332,14 @@ void printOptionalDynamicIndexList(OpAsmPrinter &printer, Operation *op,
                                    OperandRange values,
                                    ArrayRef<int64_t> integers,
                                    TypeRange valueTypes = TypeRange()) {
-
-  if (values.empty() && llvm::all_of(integers, [](int64_t i) {
-        // place-holder value MAX indicating user doesn't provide offsets
-        return i == std::numeric_limits<int64_t>::max();
-      }))
+  if (values.empty() && integers.empty()) 
     return;
+  if (values.empty() && llvm::all_of(integers, [](int64_t i) {
+      // place-holder value MAX indicating user doesn't provide offsets
+      return i == std::numeric_limits<int64_t>::max();
+    }))
+    return;
+
   printer << '[';
   unsigned dynamicValIdx = 0;
   llvm::interleaveComma(integers, printer, [&](int64_t integer) {
@@ -376,6 +378,18 @@ LogicalResult PrefetchNdOp::verify() {
 //===----------------------------------------------------------------------===//
 // XeGPU_LoadNdOp
 //===----------------------------------------------------------------------===//
+void LoadNdOp::build(OpBuilder &builder, OperationState &state, ::mlir::Type value, ::mlir::Value tensorDesc, UnitAttr packed, DenseI64ArrayAttr transpose, xegpu::CachePolicyAttr l1_hint, xegpu::CachePolicyAttr l2_hint, xegpu::CachePolicyAttr l3_hint) {
+
+  return build(builder, state, value, tensorDesc, ValueRange(), DenseI64ArrayAttr(), packed, transpose, l1_hint, l2_hint, l3_hint);
+
+}
+
+void LoadNdOp::build(OpBuilder &builder, OperationState &state, ::mlir::Type value, ::mlir::TypedValue<TensorDescType> tensorDesc) {
+
+  return build(builder, state, value, tensorDesc, ValueRange(), DenseI64ArrayAttr(), UnitAttr(), DenseI64ArrayAttr(), xegpu::CachePolicyAttr(), xegpu::CachePolicyAttr(), xegpu::CachePolicyAttr());
+
+}
+
 LogicalResult LoadNdOp::verify() {
   auto tdescTy = getTensorDescType();
   auto valueTy = getType();

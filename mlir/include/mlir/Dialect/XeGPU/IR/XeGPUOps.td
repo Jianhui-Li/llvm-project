@@ -352,11 +352,14 @@ def XeGPU_LoadNdOp : XeGPU_Op<"load_nd", [
   }];
 
   let arguments = (ins XeGPU_TensorDesc: $TensorDesc,
+                       Variadic<Index>: $offsets,
+                       OptionalAttr<DenseI64ArrayAttr>: $const_offsets,
                        OptionalAttr<UnitAttr>: $packed,
                        OptionalAttr<DenseI64ArrayAttr>: $transpose,
                        OptionalAttr<XeGPU_CacheHintAttr>: $l1_hint,
                        OptionalAttr<XeGPU_CacheHintAttr>: $l2_hint,
                        OptionalAttr<XeGPU_CacheHintAttr>: $l3_hint);
+
 
   let results = (outs XeGPU_ValueType: $value);
 
@@ -370,7 +373,20 @@ def XeGPU_LoadNdOp : XeGPU_Op<"load_nd", [
     }
   }];
 
-  let assemblyFormat = "$TensorDesc prop-dict attr-dict `:` qualified(type($TensorDesc)) `->` type($value)";
+  let assemblyFormat = [{
+    $TensorDesc `` 
+    custom<OptionalDynamicIndexList>($offsets, $const_offsets) 
+    prop-dict attr-dict `:` qualified(type($TensorDesc)) `->` type($value)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "Type": $value, "TypedValue<TensorDescType>": $TensorDesc)>,
+
+    OpBuilder<(ins "Type": $value, "Value": $TensorDesc, 
+    "UnitAttr": $packed, "DenseI64ArrayAttr": $transpose, "xegpu::CachePolicyAttr": $l1_hint, "xegpu::CachePolicyAttr": $l2_hint, "xegpu::CachePolicyAttr": $l3_hint
+    )>
+  ];
+
   let hasVerifier = 1;
 }
 
