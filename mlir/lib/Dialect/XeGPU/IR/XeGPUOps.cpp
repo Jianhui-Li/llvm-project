@@ -328,31 +328,42 @@ ParseResult parseOptionalDynamicIndexList(
   return success();
 }
 
-void printOptionalDynamicIndexList(OpAsmPrinter &printer, Operation *op,
-                                   OperandRange values,
-                                   ArrayRef<int64_t> integers,
-                                   TypeRange valueTypes = TypeRange()) {
-  if (values.empty() && integers.empty()) 
-    return;
-  if (values.empty() && llvm::all_of(integers, [](int64_t i) {
-      // place-holder value MAX indicating user doesn't provide offsets
-      return i == std::numeric_limits<int64_t>::max();
-    }))
-    return;
 
-  printer << '[';
-  unsigned dynamicValIdx = 0;
-  llvm::interleaveComma(integers, printer, [&](int64_t integer) {
-    if (ShapedType::isDynamic(integer)) {
-      printer << values[dynamicValIdx];
-      if (!valueTypes.empty())
-        printer << " : " << valueTypes[dynamicValIdx];
-      ++dynamicValIdx;
-    } else {
-      printer << integer;
-    }
-  });
-  printer << ']';
+void printOptionalDynamicIndexList(
+    OpAsmPrinter &printer, Operation *op, OperandRange values,
+    ArrayRef<int64_t> integers, TypeRange valueTypes = TypeRange(),
+    AsmParser::Delimiter delimiter = AsmParser::Delimiter::Square) {
+  //To debug the program, print the value of values and integers only if they are not empty.
+  // llvm::outs() << "print begin op:\n" << op->getName() << "\n";
+  // if (!values.empty()) {
+  //   llvm::outs() << "Values: ";
+  //   for (auto value : values) {
+  //     llvm::outs() << value << " ";
+  //   }
+  //   llvm::outs() << "\n";
+  // }
+
+  // if (!integers.empty()) {
+  //   llvm::outs() << "Integers: ";
+  //   for (auto integer : integers) {
+  //     llvm::outs() << integer << " ";
+  //   }
+  //   llvm::outs() << "\n";
+  // }
+
+  // llvm::outs() << "print finish\n";
+
+
+
+  return printDynamicIndexList(printer, op, values, integers,
+                               /*scalableFlags=*/{}, valueTypes, delimiter);
+}
+
+void printOptionalDynamicIndexList(
+    OpAsmPrinter &printer, Operation *op, OperandRange values,
+    DenseI64ArrayAttr integers) {
+    if (!integers) return;
+  printOptionalDynamicIndexList(printer, op, values, integers.asArrayRef());
 }
 
 //===----------------------------------------------------------------------===//
