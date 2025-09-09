@@ -329,6 +329,7 @@ def XeGPU_LoadNdOp : XeGPU_Op<"load_nd", [
                        OptionalAttr<DenseI64ArrayAttr>: $const_offsets,
                        OptionalAttr<UnitAttr>: $packed,
                        OptionalAttr<DenseI64ArrayAttr>: $transpose,
+                       OptionalAttr<I32Attr>: $transpose_bit_width,
                        OptionalAttr<XeGPU_CacheHintAttr>: $l1_hint,
                        OptionalAttr<XeGPU_CacheHintAttr>: $l2_hint,
                        OptionalAttr<XeGPU_CacheHintAttr>: $l3_hint);
@@ -1087,8 +1088,9 @@ def XeGPU_FenceOp: XeGPU_Op<"fence", []> {
         within each workgroup. "GPU" means the scope would be across workgroups within the GPU.
   }];
   let arguments = (ins XeGPU_MemorySpaceAttr: $memory_kind,
-                       XeGPU_FenceScopeAttr: $fence_scope);
-  let assemblyFormat = [{`memory_kind` `=` `` $memory_kind `,` `fence_scope` `=` `` $fence_scope attr-dict}];
+                       XeGPU_FenceScopeAttr: $fence_scope,
+                       OptionalAttr<XeGPU_FenceOpFlushAttr>: $fence_op_flush);
+  let assemblyFormat = [{`memory_kind` `=` `` $memory_kind `,` `fence_scope` `=` `` $fence_scope (`,` `fence_op_flush` `=` `` $fence_op_flush^)? attr-dict}];
   let extraClassDeclaration = extraBaseClassDeclaration;
 }
 
@@ -1260,5 +1262,9 @@ def XeGPU_MemDescSubviewOp: XeGPU_Op<"mem_desc_subview",
   let hasVerifier = 1;
 }
 
+def XeGPU_CompileHintOp : XeGPU_Op<"compile_hint", []> {
+  let summary = "prevents the compiler from scheduling.";
+  let assemblyFormat = [{ attr-dict }];
+}
 
 #endif // MLIR_DIALECT_XEGPU_IR_XEGPUOPS_TD

@@ -316,8 +316,10 @@ LogicalResult Serializer::processDecorationAttr(Location loc, uint32_t resultID,
     }
     return emitError(loc, "expected FPRoundingModeAttr attribute for ")
            << stringifyDecoration(decoration);
+  case spirv::Decoration::Alignment:
   case spirv::Decoration::Binding:
   case spirv::Decoration::DescriptorSet:
+  case spirv::Decoration::FuncParamIOKindINTEL:
   case spirv::Decoration::Location:
     if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
       args.push_back(intAttr.getValue().getZExtValue());
@@ -354,6 +356,10 @@ LogicalResult Serializer::processDecorationAttr(Location loc, uint32_t resultID,
   case spirv::Decoration::Block:
   case spirv::Decoration::Invariant:
   case spirv::Decoration::Patch:
+  case spirv::Decoration::SingleElementVectorINTEL:
+  case spirv::Decoration::VectorComputeCallableFunctionINTEL:
+  case spirv::Decoration::VectorComputeFunctionINTEL:
+  case spirv::Decoration::VectorComputeVariableINTEL:
     // For unit attributes and decoration attributes, the args list
     // has no values so we do nothing.
     if (isa<UnitAttr, DecorationAttr>(attr))

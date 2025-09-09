@@ -485,7 +485,9 @@ struct TransferReadLowering : public OpRewritePattern<vector::TransferReadOp> {
     // By default, no specific caching policy is assigned.
     xegpu::CachePolicyAttr hint = nullptr;
     auto loadOp = xegpu::LoadNdOp::create(rewriter, loc, vecTy, ndDesc,
+                                          ValueRange(), DenseI64ArrayAttr(),
                                           /*packed=*/nullptr, transposeAttr,
+                                          /*transpose_bit_width*/nullptr,
                                           /*l1_hint=*/hint,
                                           /*l2_hint=*/hint, /*l3_hint=*/hint);
     rewriter.replaceOp(readOp, loadOp);
@@ -569,7 +571,10 @@ struct LoadLowering : public OpRewritePattern<vector::LoadOp> {
     // By default, no specific caching policy is assigned.
     xegpu::CachePolicyAttr hint = nullptr;
     auto loadNdOp = xegpu::LoadNdOp::create(
-        rewriter, loc, vecTy, ndDesc, /*packed=*/nullptr, /*transpose=*/nullptr,
+        rewriter, loc, vecTy, ndDesc,
+        ValueRange(), DenseI64ArrayAttr(),
+        /*packed=*/nullptr, /*transpose=*/nullptr,
+        /*transpose_bit_width*/nullptr,
         /*l1_hint=*/hint,
         /*l2_hint=*/hint, /*l3_hint=*/hint);
     rewriter.replaceOp(loadOp, loadNdOp);

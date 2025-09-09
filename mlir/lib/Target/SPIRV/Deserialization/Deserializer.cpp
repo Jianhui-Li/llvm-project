@@ -283,6 +283,7 @@ LogicalResult spirv::Deserializer::processDecoration(ArrayRef<uint32_t> words) {
         symbol, FPRoundingModeAttr::get(opBuilder.getContext(),
                                         static_cast<FPRoundingMode>(words[2])));
     break;
+  case spirv::Decoration::Alignment:
   case spirv::Decoration::DescriptorSet:
   case spirv::Decoration::Binding:
     if (words.size() != 3) {
@@ -346,6 +347,10 @@ LogicalResult spirv::Deserializer::processDecoration(ArrayRef<uint32_t> words) {
   case spirv::Decoration::Constant:
   case spirv::Decoration::Invariant:
   case spirv::Decoration::Patch:
+  case spirv::Decoration::SingleElementVectorINTEL:
+  case spirv::Decoration::VectorComputeCallableFunctionINTEL:
+  case spirv::Decoration::VectorComputeFunctionINTEL:
+  case spirv::Decoration::VectorComputeVariableINTEL:
     if (words.size() != 2) {
       return emitError(unknownLoc, "OpDecoration with ")
              << decorationName << "needs a single target <id>";
@@ -354,6 +359,7 @@ LogicalResult spirv::Deserializer::processDecoration(ArrayRef<uint32_t> words) {
     break;
   case spirv::Decoration::Location:
   case spirv::Decoration::SpecId:
+  case spirv::Decoration::FuncParamIOKindINTEL:
     if (words.size() != 3) {
       return emitError(unknownLoc, "OpDecoration with ")
              << decorationName << "needs a single integer literal";
