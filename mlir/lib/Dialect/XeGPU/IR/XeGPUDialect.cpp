@@ -17,6 +17,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
+#include <memory>
+
 using std::optional;
 
 namespace mlir {
@@ -647,8 +649,135 @@ void MemDescType::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
+// a helper utility to perform binary operation on OpFoldResult.
+// If both a and b are attributes, it will simply return the result.
+// Otherwise, the corresponding arith op will be generated, and an
+// contant op will be created if one of them is an attribute.
+template <typename ArithOp>
+OpFoldResult genBinOp(OpFoldResult a, OpFoldResult b, Location loc,
+                      PatternRewriter &rewriter) {
+  auto aVal = getValueOrCreateConstantIndexOp(rewriter, loc, a);
+  auto bVal = getValueOrCreateConstantIndexOp(rewriter, loc, b);
+  return rewriter.create<ArithOp>(loc, aVal, bVal).getResult();
+}
+
+// a helper utility to perform division operation on OpFoldResult and int64_t.
+#define div(a, b)                                                              \
+  genBinOp<arith::DivSIOp>(a, rewriter.getIndexAttr(b), loc, rewriter)
+
+// a helper utility to perform reminder operation on OpFoldResult and int64_t.
+#define rem(a, b)                                                              \
+  genBinOp<arith::RemSIOp>(a, rewriter.getIndexAttr(b), loc, rewriter)
+
+// a helper utility to perform multiply operation on OpFoldResult and int64_t.
+#define mul(a, b)                                                              \
+  genBinOp<arith::MulIOp>(a, rewriter.getIndexAttr(b), loc, rewriter)
+
+// a helper utility to perform addition operation on two OpFoldResult.
+#define add(a, b) genBinOp<arith::AddIOp>(a, b, loc, rewriter)
+
+OpFoldResult MemDescType::getFlattenedOffsets(PatternRewriter &rewriter,
+                                              Location loc,
+                                              ArrayRef<OpFoldResult> offsets,
+                                              ArrayRef<int64_t> tileShape,
+                                              unsigned scaleFactor) {
+  // Currently only works for rank-2 MemDesc.
+  assert(getRank() == 2 && "Only rank-2 MemDesc is supported.");
+  SmallVector<OpFoldResult> tileOffset(offsets);
+  SmallVector<int64_t> blkShape = getBlockSize();
+  SmallVector<int64_t> slmShape = llvm::to_vector(getShape());
+
+  // Given the offset [y, x], SLM shape [H, W], and SLM block size [BH, BW]:
+  // calculate the linearized base address of the SLM block where the tile is
+  // located. The block ID containing the tile is computed as:
+  //     [id_y, id_x] = [y / BH, x / BW]
+  // If the block is stored in row-major order, the base address of the block
+  // is then computed as:
+  //     (id_y * (W / BW) + id_x) * BH * BW.
+  // If the block is stored in column-major order, the base address of the block
+  // is then computed as:
+  //     (id_y + id_x * (H / BH)) * BH * BW.
+
+  // It assumes the blocks are stored in row-major order.
+  auto getBlockBaseAddr = [&](ArrayRef<OpFoldResult> offsets,
+                              ArrayRef<int64_t> blkShape,
+                              ArrayRef<int64_t> slmShape) -> OpFoldResult {
+    SmallVector<int64_t> grids;
+    for (auto [shape, blk] : llvm::zip_equal(slmShape, blkShape))
+      grids.push_back(shape / blk);
+
+    SmallVector<OpFoldResult> blkId;
+    for (auto [off, size, grid] : llvm::zip_equal(offsets, blkShape, grids))
+      blkId.push_back(grid == 1 ? rewriter.getIndexAttr(0) : div(off, size));
+
+    // Compute the linearized block Id
+    OpFoldResult linearId = blkId.pop_back_val();
+    while (blkId.size()) {
+      int64_t stride = grids.pop_back_val();
+      auto dim = blkId.pop_back_val();
+      linearId = add(mul(dim, stride), linearId);
+    }
+    auto blockSize = std::accumulate(blkShape.begin(), blkShape.end(), 1,
+                                     std::multiplies<int64_t>());
+    return mul(linearId, blockSize);
+  };
+
+  // transform column-major view of slmShape, blkShape and offsets to
+  // row-major for convinience.
+  if (isColMajor()) {
+    std::reverse(tileOffset.begin(), tileOffset.end());
+    std::reverse(slmShape.begin(), slmShape.end());
+    std::reverse(blkShape.begin(), blkShape.end());
+  }
+
+  tileOffset[1] = div(tileOffset[1], scaleFactor);
+  slmShape[1] /= scaleFactor;
+  blkShape[1] /= scaleFactor;
+
+  OpFoldResult blockAddr = getBlockBaseAddr(tileOffset, blkShape, slmShape);
+
+  // TODO: The design requires y == 0 if isColMajor otherwise x == 0.
+  // Unforturnately, This condition cannot be statically verified at compile
+  // time. Insert `cr.assertOp` here when its lowering is supported, in form of:
+  // if (isColMajor())
+  //   assert y == 0;
+  // else
+  //   assert x == 0;
+  auto y = rem(tileOffset[0], blkShape[0]);
+  auto x = rem(tileOffset[1], blkShape[1]);
+  auto inBlockOffset = add(mul(y, blkShape[1]), x);
+  OpFoldResult base = add(blockAddr, inBlockOffset);
+
+  if (isColMajor()) {
+    // Gather/scatter operations are employed for column-major data access.
+    // To support this, a version of the offset pattern tailored for
+    // gather/scatter must be generated. The tileShape[1] dimension is mapped to
+    // SIMD lanes, where each lane accesses consecutive rows within the same
+    // column. The stride between two rows are blkShape[1]. Example layout:
+    // ------------------ (base) lane 0 ------------------
+    // ------------------------- lane 1 ------------------
+    // ------------------------- lane 2 ------------------
+    // ------------------------- lane x ------------------
+    int numSIMDlanes = tileShape[1];
+    // cst is to store the constant offsets for each row in the tile.
+    // e.g., [0, 16, 32, 48, ...]
+    auto stride = blkShape[1];
+    llvm::SmallVector<int64_t> cst(numSIMDlanes);
+    std::generate(cst.begin(), cst.end(),
+                  [stride, i = 0]() mutable { return stride * i++; });
+    auto cstOffsets = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIndexVectorAttr(cst));
+    auto baseValue = getValueOrCreateConstantIndexOp(rewriter, loc, base);
+    auto idxTy = VectorType::get(numSIMDlanes, rewriter.getIndexType());
+    auto splat = rewriter.create<vector::SplatOp>(loc, baseValue, idxTy);
+    auto result = add(splat.getResult(), cstOffsets.getResult());
+    base = getValueOrCreateConstantIndexOp(rewriter, loc, result);
+  }
+  return base;
+}
+
 //===----------------------------------------------------------------------===//
-// XeGPU_MemDescType
+// XeGPU_MemLayoutAttr
 //===----------------------------------------------------------------------===//
 
 Attribute MemLayoutAttr::parse(AsmParser &parser, Type type) {

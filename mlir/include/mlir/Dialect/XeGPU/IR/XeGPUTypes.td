@@ -245,6 +245,46 @@ def XeGPU_MemDesc: XeGPUTypeDef<"MemDesc", "mem_desc", [ShapedTypeInterface], "m
       Builder builder(getContext());
       return builder.getI64ArrayAttr(defaultStrides);
     }
+
+    /// Heuristic to determine if the MemDesc uses column-major layout,
+    /// based on the rank and the value of the first stride dimension.
+    bool isColMajor() {
+      auto dim0 = dyn_cast<IntegerAttr>(getStrides()[0]);
+      return getRank() == 2 && dim0 && dim0.getInt() == 1;
+    }
+
+    // get the Blocking shape for a MemDescType, Which is represented
+    // as an attribute in MemDescType. By default it will the shape
+    // of the mdescTy
+    SmallVector<int64_t> getBlockSize() {
+      SmallVector<int64_t> size(getShape());
+      MemLayoutAttr layout = getMemLayout();
+      if (layout && layout.hasAttr("block")) {
+        ArrayAttr attr = layout.getBlockAttr();
+        size.clear();
+        llvm::for_each(attr, [&](Attribute elem) {
+          if (auto intElem = dyn_cast<IntegerAttr>(elem))
+            size.push_back(intElem.getInt());
+        });
+      }
+      return size;
+    }
+
+    /// Computes the linearized (flattened) offset for accessing a tile,
+    /// based on the provided offsets and tile shape. If the memory descriptor
+    /// indicates column-major layout, gather/scatter operations are assumed,
+    /// and a vector of offsets is generated. Otherwise, a scalar offset is
+    /// returned, representing the start of a 1D block operation.
+    ///
+    /// Since the computation is based on the number of elements, `scaleFactor`
+    /// is used to account for scenarios where the hardware operates on 32-bit
+    /// or wider data types, while the actual data is of a lower bitwidth
+    /// (e.g., 16-bit, for which the scaleFactor is 2).
+    OpFoldResult getFlattenedOffsets(PatternRewriter &rewriter, Location loc,
+                                     ArrayRef<OpFoldResult> offsets,
+                                     ArrayRef<int64_t> tileShape,
+                                     unsigned scaleFactor = 1);
+
   }];
 
   let hasCustomAssemblyFormat = true;
