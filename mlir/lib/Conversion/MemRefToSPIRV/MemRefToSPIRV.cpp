@@ -393,6 +393,64 @@ AllocOpPattern::matchAndRewrite(memref::AllocOp operation, OpAdaptor adaptor,
   return success();
 }
 
+class ViewOpPattern final : public OpConversionPattern<memref::ViewOp> {
+public:
+  using OpConversionPattern<memref::ViewOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::ViewOp operation, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+
+//===----------------------------------------------------------------------===//
+// ViewOp
+// %view = memref.view %alloc[%c0][] : memref<2048xi8, 3> to memref<512xf32, 3>
+//  spirv.GlobalVariable @__workgroup_mem__1 : !spirv.ptr<!spirv.array<2048 x i8>, Workgroup>
+//  %1 = spirv.Bitcast @__workgroup_mem__1 : !spirv.ptr<!spirv.array<2048 x i8>, Workgroup> to !spirv.ptr<!spirv.array<512 x f32>, Workgroup>
+//
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+ViewOpPattern::matchAndRewrite(memref::ViewOp operation, OpAdaptor adaptor,
+                               ConversionPatternRewriter &rewriter) const {
+  MemRefType ToType = operation.getType();
+
+  // insert spirv.bitcast which cast the pointer type from spirvFromType to spirvToType
+  Type spirvToType = getTypeConverter()->convertType(ToType);
+  if (!spirvToType)
+    return rewriter.notifyMatchFailure(operation, "type conversion failed");
+  
+  // need to limit the case where the source is a memref with element type i8
+  // the result memref must have static sizes.
+  MemRefType FromType = cast<MemRefType>(operation.getSource().getType());
+  if (!FromType.getElementType().isInteger(8) || !FromType.hasStaticShape())
+    return rewriter.notifyMatchFailure(operation, "unhandled view type");
+  if (!ToType.hasStaticShape())
+    return rewriter.notifyMatchFailure(operation, "unhandled view type");
+  
+  // get base pointer from adaptor.getSource()
+  Value basePtr = adaptor.getSource();
+  // get the offset
+  Value offset = adaptor.getByteShift();
+  if (offset) {
+    Location loc = operation.getLoc();
+    auto *spirvTypeConverter = getTypeConverter<SPIRVTypeConverter>();
+    Type materializedIndexType = spirvTypeConverter->getIndexType();
+    Value basePtrAsInt = rewriter.createOrFold<spirv::ConvertPtrToUOp>(loc, materializedIndexType, basePtr);
+    Value newPtrAsInt = rewriter.createOrFold<spirv::IAddOp>(loc, materializedIndexType, basePtrAsInt, offset);
+    Value newPtr = rewriter.createOrFold<spirv::ConvertUToPtrOp>(loc, basePtr.getType(), newPtrAsInt);
+    basePtr = newPtr;
+  }   
+
+  Location loc = operation.getLoc();
+  Value castOp = rewriter.createOrFold<spirv::BitcastOp>(
+      loc, spirvToType, adaptor.getSource());
+  rewriter.replaceOp(operation, castOp);
+  return success();
+} 
+
+
 //===----------------------------------------------------------------------===//
 // AllocOp
 //===----------------------------------------------------------------------===//
@@ -1071,7 +1129,7 @@ LogicalResult ExtractAlignedPointerAsIndexOpPattern::matchAndRewrite(
 namespace mlir {
 void populateMemRefToSPIRVPatterns(const SPIRVTypeConverter &typeConverter,
                                    RewritePatternSet &patterns) {
-  patterns.add<AllocaOpPattern, AllocOpPattern, AtomicRMWOpPattern,
+  patterns.add<AllocaOpPattern, AllocOpPattern, ViewOpPattern, AtomicRMWOpPattern,
                DeallocOpPattern, IntLoadOpPattern, ImageLoadOpPattern,
                IntStoreOpPattern, LoadOpPattern, MemorySpaceCastOpPattern,
                StoreOpPattern, ReinterpretCastPattern, CastPattern,
