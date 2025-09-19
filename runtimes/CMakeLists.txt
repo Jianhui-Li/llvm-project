@@ -44,7 +44,6 @@ if(LLVM_ENABLE_RUNTIMES STREQUAL "all" )
 endif()
 include(SortSubset)
 sort_subset("${LLVM_SUPPORTED_RUNTIMES}" "${LLVM_ENABLE_RUNTIMES}" LLVM_ENABLE_RUNTIMES)
-set(LLVM_RT_TOOLS_BINARY_DIR ${LLVM_TOOLS_BINARY_DIR} CACHE STRING "runtime path to required test tools")
 foreach(proj ${LLVM_ENABLE_RUNTIMES})
   set(proj_dir "${CMAKE_CURRENT_SOURCE_DIR}/../${proj}")
   if(IS_DIRECTORY ${proj_dir} AND EXISTS ${proj_dir}/CMakeLists.txt)
@@ -182,14 +181,13 @@ if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
   endif()
 endif()
 
+# The NVPTX target needs to override linking to pass compiler flag checks.
+if("${LLVM_RUNTIMES_TARGET}" MATCHES "^nvptx")
+  set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -flto -c")
+endif()
+
 # Avoid checking whether the compiler is working.
 set(LLVM_COMPILER_CHECKED ON)
-
-# This can be used to detect whether we're targeting a GPU architecture.
-if("${LLVM_RUNTIMES_TARGET}" MATCHES "^amdgcn" OR
-   "${LLVM_RUNTIMES_TARGET}" MATCHES "^nvptx64")
-  set(LLVM_RUNTIMES_GPU_BUILD ON)
-endif()
 
 # Handle common options used by all runtimes.
 include(AddLLVM)

@@ -110,6 +110,7 @@ public:
     renderscript32, // 32-bit RenderScript
     renderscript64, // 64-bit RenderScript
     ve,             // NEC SX-Aurora Vector Engine
+    nvsass,         // NVIDIA SASS
     LastArchType = ve
   };
   enum SubArchType {
@@ -180,7 +181,8 @@ public:
     DXILSubArch_v1_6,
     DXILSubArch_v1_7,
     DXILSubArch_v1_8,
-    LatestDXILSubArch = DXILSubArch_v1_8,
+    DXILSubArch_v1_9,
+    LatestDXILSubArch = DXILSubArch_v1_9,
   };
   enum VendorType {
     UnknownVendor,
@@ -245,7 +247,8 @@ public:
     LiteOS,
     Serenity,
     Vulkan, // Vulkan SPIR-V
-    LastOSType = Vulkan
+    CheriotRTOS,
+    LastOSType = CheriotRTOS
   };
   enum EnvironmentType {
     UnknownEnvironment,
@@ -303,6 +306,7 @@ public:
     Callable,
     Mesh,
     Amplification,
+    RootSignature,
     OpenCL,
     OpenHOS,
     Mlibc,
@@ -870,7 +874,7 @@ public:
            Env == Triple::Intersection || Env == Triple::AnyHit ||
            Env == Triple::ClosestHit || Env == Triple::Miss ||
            Env == Triple::Callable || Env == Triple::Mesh ||
-           Env == Triple::Amplification;
+           Env == Triple::Amplification || Env == Triple::RootSignature;
   }
 
   /// Tests whether the target is SPIR (32- or 64-bit).
@@ -901,6 +905,8 @@ public:
   bool isAMDGCN() const { return getArch() == Triple::amdgcn; }
 
   bool isAMDGPU() const { return getArch() == Triple::r600 || isAMDGCN(); }
+
+  bool isNVSASS() const { return getArch() == Triple::nvsass; }
 
   /// Tests whether the target is Thumb (little and big endian).
   bool isThumb() const {
@@ -1100,6 +1106,12 @@ public:
     return getArch() == Triple::x86 || getArch() == Triple::x86_64;
   }
 
+  /// Tests whether the target is x86 (32-bit).
+  bool isX86_32() const { return getArch() == Triple::x86; }
+
+  /// Tests whether the target is x86 (64-bit).
+  bool isX86_64() const { return getArch() == Triple::x86_64; }
+
   /// Tests whether the target is VE
   bool isVE() const {
     return getArch() == Triple::ve;
@@ -1264,7 +1276,9 @@ public:
   LLVM_ABI bool isCompatibleWith(const Triple &Other) const;
 
   /// Test whether the target triple is for a GPU.
-  bool isGPU() const { return isSPIRV() || isNVPTX() || isAMDGPU(); }
+  bool isGPU() const {
+    return isSPIRV() || isNVPTX() || isAMDGPU() || isNVSASS();
+  }
 
   /// Merge target triples.
   LLVM_ABI std::string merge(const Triple &Other) const;
@@ -1325,6 +1339,10 @@ public:
                                            const VersionTuple &Version);
 
   LLVM_ABI ExceptionHandling getDefaultExceptionHandling() const;
+
+  /// Compute the LLVM IR data layout string based on the triple. Some targets
+  /// customize the layout based on the ABIName string.
+  LLVM_ABI std::string computeDataLayout(StringRef ABIName = "") const;
 };
 
 } // End llvm namespace
