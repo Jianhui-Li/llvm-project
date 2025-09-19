@@ -1129,7 +1129,7 @@ LogicalResult MemDescSubviewOp::verify() {
           [](auto p) { return std::get<0>(p) > std::get<1>(p); }))
     return emitOpError("result shape must not exceed source shape.");
 
-  if (srcTy.getStrides() != resTy.getStrides())
+  if (srcTy.getStridesAttr() != resTy.getStridesAttr())
     return emitOpError("result must inherit the source strides.");
 
   return success();
