@@ -232,7 +232,7 @@ def XeGPU_MemDesc: XeGPUTypeDef<"MemDesc", "mem_desc", [ShapedTypeInterface], "m
       return MemDescType::get(getContext(), shape.value_or(getShape()), elementType, getMemLayout());
     }
 
-    ArrayAttr getStrides() {
+    ArrayAttr getStridesAttr() {
       auto layout = getMemLayout();
       if (layout && layout.hasAttr("stride")) {
         return layout.getStrides();
@@ -249,7 +249,7 @@ def XeGPU_MemDesc: XeGPUTypeDef<"MemDesc", "mem_desc", [ShapedTypeInterface], "m
     /// Heuristic to determine if the MemDesc uses column-major layout,
     /// based on the rank and the value of the first stride dimension.
     bool isColMajor() {
-      auto dim0 = dyn_cast<IntegerAttr>(getStrides()[0]);
+      auto dim0 = dyn_cast<IntegerAttr>(getStridesAttr()[0]);
       return getRank() == 2 && dim0 && dim0.getInt() == 1;
     }
 
@@ -270,20 +270,80 @@ def XeGPU_MemDesc: XeGPUTypeDef<"MemDesc", "mem_desc", [ShapedTypeInterface], "m
       return size;
     }
 
-    /// Computes the linearized (flattened) offset for accessing a tile,
-    /// based on the provided offsets and tile shape. If the memory descriptor
-    /// indicates column-major layout, gather/scatter operations are assumed,
-    /// and a vector of offsets is generated. Otherwise, a scalar offset is
-    /// returned, representing the start of a 1D block operation.
-    ///
-    /// Since the computation is based on the number of elements, `scaleFactor`
-    /// is used to account for scenarios where the hardware operates on 32-bit
-    /// or wider data types, while the actual data is of a lower bitwidth
-    /// (e.g., 16-bit, for which the scaleFactor is 2).
-    OpFoldResult getFlattenedOffsets(PatternRewriter &rewriter, Location loc,
-                                     ArrayRef<OpFoldResult> offsets,
-                                     ArrayRef<int64_t> tileShape,
-                                     unsigned scaleFactor = 1);
+    // Get strides as vector of integer. 
+    // If it contains block attribute, the strides are blocked strides.
+    //
+    // The blocking is applied against the original matrix shape
+    // so that the linear offset is not impacted by the subview.
+    //
+    // It first computes the original matrix shape using the stride info,
+    // then computes the number of blocks in each dimension of original shape,
+    // then compute the outer block shape and stride,
+    // then combines the inner and outer block shape and stride
+    // e.g. for mem_desc<32x256xf16, @block=[16, 8], @strides=[1, 32]>
+    // its memory layout tuple is ([2,32,16,8],[128,256,1,8])
+    // for  mem_desc<256x32xf16, @block=[8, 16]> with default @stride[32, 1]
+    // its memory layout tuple is ([32,2,8,16],[256,128,16,1])
+    SmallVector<int64_t> getStrides() {
+
+      SmallVector<int64_t> matrixShape(getShape().begin(),
+                                      getShape().end());
+
+      ArrayAttr strideAttr = getStridesAttr();
+      SmallVector<int64_t> strides;
+      for (Attribute attr : strideAttr.getValue()) {
+        strides.push_back(cast<IntegerAttr>(attr).getInt());
+      }
+
+      SmallVector<int64_t> innerBlkShape = getBlockSize();
+      if (innerBlkShape.empty())
+        return strides;
+
+      SmallVector<int, 4> perm = llvm::to_vector<4>(
+                                    llvm::seq<int>(0, strides.size()));
+      llvm::sort(perm, [&](int a, int b) { return strides[a] < strides[b]; });
+
+      assert(strides[perm[0]] == 1 && "inner most dim must have stride 1");
+
+      SmallVector<int64_t> innerBlkStride(innerBlkShape.size());
+      innerBlkStride[perm[0]] = 1;
+      for (size_t i = 1; i < perm.size(); ++i)
+        innerBlkStride[perm[i]] =
+            innerBlkStride[perm[i - 1]] * innerBlkShape[perm[i - 1]];
+
+      // compute the original matrix shape using the stride info
+      // and compute the number of blocks in each dimension
+      // The shape of highest dim can't be derived from stride info,
+      // but doesn't impact the stride computation for blocked layout.
+      SmallVector<int64_t> matrixShapeOrig(matrixShape.size());
+      SmallVector<int64_t> BlkShapeOrig(matrixShape.size());
+      for (size_t i = 0; i < perm.size() - 1; ++i) {
+        matrixShapeOrig[perm[i]] = strides[perm[i + 1]] / strides[perm[i]];
+        BlkShapeOrig[perm[i]] = matrixShapeOrig[perm[i]] / innerBlkShape[perm[i]];
+      }
+
+      int64_t innerBlkSize = 1;
+      for (auto s : innerBlkShape)
+        innerBlkSize *= s;
+
+      SmallVector<int64_t> outerBlkStride(matrixShape.size());
+      outerBlkStride[perm[0]] = innerBlkSize;
+      for (size_t i = 0; i < perm.size() - 1; ++i) {
+        outerBlkStride[perm[i + 1]] =
+            outerBlkStride[perm[i]] * BlkShapeOrig[perm[i]];
+      }
+
+      // combine the inner and outer strides
+      SmallVector<int64_t> blockedStrides;
+      blockedStrides.append(outerBlkStride.begin(), outerBlkStride.end());
+      blockedStrides.append(innerBlkStride.begin(), innerBlkStride.end());
+      return blockedStrides;
+    }
+    /// Generates instructions to compute the linearize offset 
+    //  if the memory descriptor is blocked, it returns linearize offset based on the blocked layout
+    //  the strides of memory descriptor is always considered regardless of blocked or not
+    Value getLinearOffsets(OpBuilder &builder,
+                       Location loc, ArrayRef<OpFoldResult> offsets);
 
   }];
 
