@@ -1400,8 +1400,16 @@ struct VectorMultiReductionDistribution : public gpu::WarpDistributionPattern {
     xegpu::DistributeLayoutAttr sourceLayout =
         xegpu::getTemporaryLayout(reductionOp->getOpOperand(0));
 
+    // before get distribute vec type for source, first set its shape to be unit
+    // for the reduction dimension
+    SmallVector<int64_t, 2> sourceShape(sourceType.getShape().begin(),
+                                        sourceType.getShape().end());
+    sourceShape[reductionDim] = 1;
+    VectorType modifiedSourceType =
+        VectorType::get(sourceShape, sourceType.getElementType());
+
     FailureOr<VectorType> sourceDistTypeOrFailure =
-        getDistVecTypeBasedOnLaneLayout(sourceLayout, sourceType);
+        getDistVecTypeBasedOnLaneLayout(sourceLayout, modifiedSourceType);
     if (failed(sourceDistTypeOrFailure))
       return rewriter.notifyMatchFailure(
           warpOp, "Failed to distribute the source vector type.");
@@ -1435,6 +1443,17 @@ struct VectorMultiReductionDistribution : public gpu::WarpDistributionPattern {
 
     bool isReductionLaneLocal = (sourceDistDim == 0 && reductionDim == 1) ||
                                 (sourceDistDim == 1 && reductionDim == 0);
+    // print here all these five variables for debugging
+    LLVM_DEBUG({
+      llvm::dbgs() << "sourceDistDim: " << sourceDistDim << "\n";
+      llvm::dbgs() << "reductionDim: " << reductionDim << "\n";
+      llvm::dbgs() << "isReductionLaneLocal: " << isReductionLaneLocal << "\n";
+      llvm::dbgs() << "resultDistributed: " << resultDistributed << "\n";
+      llvm::dbgs() << "sourceDistType: " << sourceDistType << "\n";
+      llvm::dbgs() << "distributedResultType: " << distributedResultType
+                   << "\n";
+    });
+
     if (isReductionLaneLocal && !resultDistributed)
       return rewriter.notifyMatchFailure(
           warpOp, "Expecting a distributed result for lane-local reduction.");
@@ -1457,6 +1476,12 @@ struct VectorMultiReductionDistribution : public gpu::WarpDistributionPattern {
           cast<TypedValue<VectorType>>(newWarpOp->getResult(newRetIndices[0])),
           cast<TypedValue<VectorType>>(newWarpOp->getResult(newRetIndices[1])),
           reductionOp.getKind(), reductionDim, reductionOp.getLoc(), rewriter);
+      // print the reduction op for debugging
+      LLVM_DEBUG({
+        llvm::dbgs() << "reductionOp1: " << *reductionOp << "\n";
+        llvm::dbgs() << "lowered reduction result1: " << result << "\n";
+      });
+
       // Replace the warp op result with the final result.
       rewriter.replaceAllUsesWith(newWarpOp.getResult(operandIdx), result);
       return success();
@@ -1469,6 +1494,11 @@ struct VectorMultiReductionDistribution : public gpu::WarpDistributionPattern {
         cast<TypedValue<VectorType>>(reductionOp.getSource()),
         cast<TypedValue<VectorType>>(reductionOp.getAcc()),
         reductionOp.getKind(), reductionDim, reductionOp.getLoc(), rewriter);
+    // print the reduction op for debugging
+    LLVM_DEBUG({
+      llvm::dbgs() << "reductionOp2: " << *reductionOp << "\n";
+      llvm::dbgs() << "lowered reduction result2: " << result << "\n";
+    });
     // Replace the warp op result with the final result.
     rewriter.replaceAllUsesWith(reductionOp.getResult(), result);
     return success();

@@ -143,16 +143,30 @@ XeGPUBlockingPass::getTileShape(const T &operandOrResult) const {
   } else {
     value = (Value)operandOrResult;
   }
+  ShapedType valType = dyn_cast<ShapedType>(value.getType());
 
   xegpu::DistributeLayoutAttr layout =
       xegpu::getDistributeLayoutAttr(operandOrResult);
-  if (layout && layout.isForSubgroup()) {
+  if (layout && layout.isForSubgroup() && valType) {
+    SmallVector<int64_t> valShape = llvm::to_vector(valType.getShape());
+    LDBG() << "getTileShape for value: " << value;
+
+    llvm::errs() << "valShape: [";
+    llvm::interleaveComma(valShape, llvm::errs());
+    llvm::errs() << "]\n";
+
     if (!layout.getEffectiveInstDataAsInt().empty()) {
       SmallVector<int64_t> instData = layout.getEffectiveInstDataAsInt();
-      return instData;
+      llvm::errs() << "instData: [";
+      llvm::interleaveComma(instData, llvm::errs());
+      llvm::errs() << "]\n";
+
+      SmallVector<int64_t> result;
+      for (auto [inst, val] : llvm::zip(instData, valShape))
+        result.push_back(std::min(inst, val));
+      return result;
     }
-    if (auto type = dyn_cast<ShapedType>(value.getType()))
-      return llvm::to_vector(type.getShape());
+    return valShape;
   }
   LDBG() << "failed to getTileShape for: " << value;
   return std::nullopt;

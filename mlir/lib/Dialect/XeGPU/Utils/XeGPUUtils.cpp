@@ -121,12 +121,41 @@ xegpu::getDistVecTypeBasedOnLaneLayout(xegpu::DistributeLayoutAttr layout,
   // dimensions are not distributed.
   unsigned distributionStart =
       originalType.getRank() - effectiveLaneLayout.size();
+
+  // Print original shape and lane layout for debugging
+  std::string shapeStr = "[";
+  for (auto [i, dim] : llvm::enumerate(originalType.getShape())) {
+    if (i > 0)
+      shapeStr += ", ";
+    shapeStr += std::to_string(dim);
+  }
+  shapeStr += "]";
+  LDBG() << "original shape: " << shapeStr;
+
+  std::string layoutStr = "[";
+  for (auto [i, dim] : llvm::enumerate(effectiveLaneLayout)) {
+    if (i > 0)
+      layoutStr += ", ";
+    layoutStr += std::to_string(dim);
+  }
+  layoutStr += "]";
+  LDBG() << "effective lane layout: " << layoutStr;
+
   for (auto [i, dim] : llvm::enumerate(originalType.getShape())) {
     if (i < distributionStart)
       continue;
+    if (dim == 1) {
+      distributedShape[i] = 1;
+      continue;
+    }
     // Check if the dimension can be distributed evenly.
-    if (dim % effectiveLaneLayout[i - distributionStart] != 0)
+    if (dim % effectiveLaneLayout[i - distributionStart] != 0) {
+      // print dim and the corresponding lane layout for debugging
+      LDBG() << "dimension " << i << " with size " << dim
+             << " is not divisible by lane layout "
+             << effectiveLaneLayout[i - distributionStart];
       return failure();
+    }
     distributedShape[i] = dim / effectiveLaneLayout[i - distributionStart];
   }
   return VectorType::get(distributedShape, originalType.getElementType());
