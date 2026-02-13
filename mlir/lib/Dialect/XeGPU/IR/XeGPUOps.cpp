@@ -177,7 +177,13 @@ LogicalResult
 IsValidMatrixOpParams(VectorType dataTy, MemDescType mdescTy,
                       UnitAttr subgroup_block_io, DistributeLayoutAttr layout,
                       function_ref<InFlightDiagnostic()> emitError) {
-
+//debug print for the parameters, can be removed later
+  LLVM_DEBUG({
+    llvm::dbgs() << "dataTy: " << dataTy << "\n";
+    llvm::dbgs() << "mdescTy: " << mdescTy << "\n";
+    llvm::dbgs() << "subgroup_block_io: " << subgroup_block_io << "\n";
+    llvm::dbgs() << "layout: " << layout << "\n";
+  });
   if (!dataTy) {
     if (subgroup_block_io)
       return emitError() << "subgroup_block_io "
@@ -186,8 +192,8 @@ IsValidMatrixOpParams(VectorType dataTy, MemDescType mdescTy,
       return success();
   }
 
-  if (mdescTy.getRank() != 2)
-    return emitError() << "mem_desc must be 2D.";
+  if (mdescTy.getRank() < 2)
+    return emitError() << "mem_desc must be at least 2D.";
 
   ArrayRef<int64_t> dataShape = dataTy.getShape();
   ArrayRef<int64_t> mdescShape = mdescTy.getShape();
