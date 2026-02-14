@@ -220,7 +220,8 @@ XeGPUBlockingPass::getTileShape(Operation *op) const {
 
     return SmallVector<int64_t>({(*aTile)[0], (*aTile)[1], (*bTile)[1]});
   }
-
+  // print op for debug
+  LDBG() << "getTileShape for op: " << *op;
   if (OpTrait::hasElementwiseMappableTraits(op) && op->getNumResults() == 1)
     return getTileShape(op->getOpResult(0));
 
@@ -228,7 +229,8 @@ XeGPUBlockingPass::getTileShape(Operation *op) const {
     return getTileShape(op->getOpOperand(0));
 
   if (isa<vector::TransposeOp, vector::BroadcastOp, vector::StepOp,
-          vector::ConstantMaskOp, vector::CreateMaskOp>(op))
+          vector::ShapeCastOp, vector::ConstantMaskOp, vector::CreateMaskOp>(
+          op))
     return getTileShape(op->getOpResult(0));
 
   return std::nullopt;

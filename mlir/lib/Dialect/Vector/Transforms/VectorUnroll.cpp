@@ -1196,24 +1196,39 @@ private:
 static bool isContiguous(ArrayRef<int64_t> extractShape,
                          ArrayRef<int64_t> shape) {
 
-  if (extractShape.size() > shape.size())
+  llvm::errs() << "[isContiguous] extractShape=["
+               << llvm::interleaved(extractShape, ", ") << "], shape=["
+               << llvm::interleaved(shape, ", ") << "]\n";
+
+  if (extractShape.size() > shape.size()) {
+    llvm::errs() << "[isContiguous] fail: extract rank > shape rank\n";
     return false;
-
-  while (!extractShape.empty() && extractShape.front() == 1) {
-    extractShape = extractShape.drop_front();
   }
 
-  while (!shape.empty() && shape.front() == 1) {
+  // while (!extractShape.empty() && extractShape.front() == 1)
+  //   extractShape = extractShape.drop_front();
+  while (!shape.empty() && shape.front() == 1)
     shape = shape.drop_front();
-  }
+
+  llvm::errs() << "[isContiguous] normalized extractShape=["
+               << llvm::interleaved(extractShape, ", ") << "], shape=["
+               << llvm::interleaved(shape, ", ") << "]\n";
 
   size_t rankDiff = shape.size() - extractShape.size();
-  if (!llvm::equal(extractShape.drop_front(), shape.drop_front(rankDiff + 1)))
+  bool trailingDimsMatch =
+      llvm::equal(extractShape.drop_front(), shape.drop_front(rankDiff + 1));
+  llvm::errs() << "[isContiguous] rankDiff=" << rankDiff
+               << ", trailingDimsMatch=" << trailingDimsMatch << "\n";
+  if (!trailingDimsMatch)
     return false;
 
   int64_t extractElements = ShapedType::getNumElements(extractShape);
   int64_t shapeElements = ShapedType::getNumElements(shape);
-  return shapeElements % extractElements == 0;
+  bool divisible = (shapeElements % extractElements == 0);
+  llvm::errs() << "[isContiguous] extractElements=" << extractElements
+               << ", shapeElements=" << shapeElements
+               << ", divisible=" << divisible << "\n";
+  return divisible;
 }
 
 /// Determines what shape to use with `vector.extract_strided_slice` to extract
@@ -1244,6 +1259,12 @@ calculateSourceExtractShape(ArrayRef<int64_t> sourceShape,
   // Build extract shape from innermost dimension outward to ensure contiguity.
   for (int i = sourceShape.size() - 1; i >= 0 && remainingElements > 1; --i) {
     int64_t takeFromDim = std::min(remainingElements, sourceShape[i]);
+    //print the takeFromDim
+    llvm::errs() << "Taking " << takeFromDim << " from dim " << i
+                 << " (remaining elements: " << remainingElements << ")\n";
+                 //print sourrce shape and extract shape at each iteration
+    llvm::errs() << "Source shape: " << sourceShape[i] << "\n";
+
     extractShape.insert(extractShape.begin(), takeFromDim);
 
     if (remainingElements % takeFromDim != 0)
@@ -1252,7 +1273,7 @@ calculateSourceExtractShape(ArrayRef<int64_t> sourceShape,
   }
 
   // Fill remaining dimensions with 1.
-  while (extractShape.size() < sourceShape.size())
+  while (extractShape.size() < sourceShape.size()) 
     extractShape.insert(extractShape.begin(), 1);
 
   if (ShapedType::getNumElements(extractShape) != targetElements)
@@ -1316,7 +1337,8 @@ struct UnrollShapeCastPattern : public OpRewritePattern<vector::ShapeCastOp> {
         getTargetShape(options, shapeCastOp);
     if (!targetShape)
       return failure();
-
+llvm::errs() << "Target shape: ["
+             << llvm::interleaved(*targetShape, ", ") << "]\n";
     VectorType sourceType = shapeCastOp.getSourceVectorType();
     VectorType resultType = shapeCastOp.getResultVectorType();
     ArrayRef<int64_t> sourceShape = sourceType.getShape();
@@ -1327,8 +1349,10 @@ struct UnrollShapeCastPattern : public OpRewritePattern<vector::ShapeCastOp> {
           shapeCastOp, "Only supports cases where target shape is "
                        "contiguous in result vector shape");
 
-    int64_t targetElements = ShapedType::getNumElements(*targetShape);
+int64_t targetElements = ShapedType::getNumElements(*targetShape);
 
+llvm::errs() << "Target elements: " << targetElements << "\n";
+      
     // Calculate the shape to extract from source.
     std::optional<SmallVector<int64_t>> extractShape =
         calculateSourceExtractShape(sourceShape, targetElements);
