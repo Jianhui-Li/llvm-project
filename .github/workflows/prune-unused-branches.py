@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import os
+import logging
 
 import github
 
@@ -22,25 +23,26 @@ def get_branches() -> list[str]:
     return [branch.replace("remotes/origin/", "") for branch in filtered_branches]
 
 
-def get_branches_from_open_prs(github_token) -> list[str]:
+def query_prs(github_token, extra_query_criteria) -> list[str]:
     gh = github.Github(auth=github.Auth.Token(github_token))
-    query = """
-  query ($after: String) {
-    search(query: "is:pr repo:llvm/llvm-project is:open head:users/", type: ISSUE, first: 100, after: $after) {
-      nodes {
-        ... on PullRequest {
-          baseRefName
-          headRefName
-          isCrossRepository
-          number
-        }
-      }
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-    }
-  }"""
+    query_template = """
+    query ($after: String) {{
+        search(query: "is:pr repo:llvm/llvm-project is:open {query_param}", type: ISSUE, first: 100, after: $after) {{
+        nodes {{
+            ... on PullRequest {{
+            baseRefName
+            headRefName
+            isCrossRepository
+            number
+            }}
+        }}
+        pageInfo {{
+            hasNextPage
+            endCursor
+        }}
+        }}
+    }}"""
+    query = query_template.format(query_param=extra_query_criteria)
     pr_data = []
     has_next_page = True
     variables = {"after": None}
@@ -54,13 +56,31 @@ def get_branches_from_open_prs(github_token) -> list[str]:
         pr_data.extend(prs)
         print(f"Processed {len(prs)} PRs")
 
+    return pr_data
+
+
+def get_branches_from_open_prs(github_token) -> list[str]:
+    pr_data = []
+    pr_data.extend(query_prs(github_token, "head:users/"))
+    # We need to explicitly check cases where the base is a user branch to
+    # ensure we capture branches that are used as a diff base for cross-repo
+    # PRs.
+    pr_data.extend(query_prs(github_token, "base:users/"))
+
     user_branches = []
     for pr in pr_data:
         if not pr["isCrossRepository"]:
             if pr["baseRefName"] != "main":
                 user_branches.append(pr["baseRefName"])
             user_branches.append(pr["headRefName"])
-    return user_branches
+        else:
+            # We want to skip cross-repo PRs where someone has simply used a
+            # users/ branch naming scheme for a branch in their fork.
+            if pr["baseRefName"] == "main":
+                continue
+            user_branches.append(pr["baseRefName"])
+    # Convert to a set to ensure we have no duplicates.
+    return list(set(user_branches))
 
 
 def get_user_branches_to_remove(
@@ -68,12 +88,25 @@ def get_user_branches_to_remove(
 ) -> list[str]:
     user_branches_to_remove = set(user_branches)
     for pr_user_branch in set(user_branches_from_prs):
+        if pr_user_branch not in user_branches_to_remove:
+            logging.warning(
+                f"Found branch {pr_user_branch} attached to a PR, but it "
+                "was not found in the repository. This is likely because "
+                "the PR was created after this workflow cloned the repository."
+            )
+            continue
         user_branches_to_remove.remove(pr_user_branch)
     return list(user_branches_to_remove)
 
 
 def generate_patch_for_branch(branch_name: str) -> bytes:
-    command_vector = ["git", "diff", f"origin/main...origin/{branch_name}"]
+    command_vector = [
+        "git",
+        "format-patch",
+        "--stdout",
+        "-k",
+        f"origin/main..origin/{branch_name}",
+    ]
     try:
         result = subprocess.run(
             command_vector, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
@@ -121,11 +154,14 @@ def delete_branches(branches_to_remove: list[str]):
 def main(github_token):
     if len(sys.argv) != 2:
         print(
-            "Invalid invocation. Correct usage: python3 prune-unused-branches.py <patch output diectory>"
+            "Invalid invocation. Correct usage: python3 prune-unused-branches.py <output diectory>"
         )
         sys.exit(1)
 
     user_branches = get_branches()
+    output_dir = sys.argv[1]
+    with open(os.path.join(output_dir, "branches.txt"), "w") as branches_file:
+        branches_file.writelines([user_branch + "\n" for user_branch in user_branches])
     user_branches_from_prs = get_branches_from_open_prs(github_token)
     print(f"Found {len(user_branches)} user branches in the repository")
     print(f"Found {len(user_branches_from_prs)} user branches associated with PRs")
@@ -133,7 +169,9 @@ def main(github_token):
         user_branches, user_branches_from_prs
     )
     print(f"Deleting {len(user_branches_to_remove)} user branches.")
-    generate_patches_for_all_branches(user_branches_to_remove, sys.argv[1])
+    generate_patches_for_all_branches(
+        user_branches_to_remove, os.path.join(output_dir, "patches")
+    )
     delete_branches(user_branches_to_remove)
 
 
