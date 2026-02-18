@@ -2193,4 +2193,14 @@ void XeGPUSubgroupDistributePass::runOnOperation() {
       op->erase();
     return WalkResult::advance();
   });
+
+  // iterate the IR and attach each function op with attribute
+  // {intel_reqd_sub_group_size = 16 : i32} the size shoud be get from
+  // uArch->getSubgroupSize()
+  getOperation()->walk([&](gpu::GPUFuncOp funcOp) {
+    auto uArch = getUArch(xegpu::getChipStr(funcOp).value_or(""));
+    funcOp->setAttr("intel_reqd_sub_group_size",
+                    IntegerAttr::get(IntegerType::get(funcOp.getContext(), 32),
+                                     uArch->getSubgroupSize()));
+  });
 }
