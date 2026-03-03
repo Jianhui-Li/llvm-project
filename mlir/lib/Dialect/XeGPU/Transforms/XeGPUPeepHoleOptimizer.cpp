@@ -226,7 +226,7 @@ static Value generateLoads(ConversionPatternRewriter &rewriter,
           ArrayRef<int64_t>{localOffsetDim0, localOffsetDim1},
           ArrayRef<int64_t>{1, 1});
       // InsertOp must have the same layout as newTensorDesc.
-      xegpu::setTemporaryLayout(insertOp->getOpResult(0), layoutAttr);
+      // xegpu::setTemporaryLayout(insertOp->getOpResult(0), layoutAttr);
       data = insertOp.getResult();
     }
   }
@@ -368,8 +368,8 @@ public:
         auto bitCastOp = vector::BitCastOp::create(rewriter, loadNdOp->getLoc(),
                                                    bitcastType, slice);
         // BitCastOp must have the same layout as the original loadNdOp.
-        xegpu::setTemporaryLayout(bitCastOp->getOpResult(0),
-                                  origTensorDescType.getLayoutAttr());
+        // xegpu::setTemporaryLayout(bitCastOp->getOpResult(0),
+        //                           origTensorDescType.getLayoutAttr());
         arraySlices.push_back(bitCastOp.getResult());
       }
       rewriter.replaceOpWithMultiple(loadNdOp, {arraySlices});
@@ -386,8 +386,8 @@ public:
     auto bitCastOp = vector::BitCastOp::create(rewriter, loadNdOp->getLoc(),
                                                loadNdOp.getType(), data);
     // BitCastOp must have the same layout as the original loadNdOp.
-    xegpu::setTemporaryLayout(bitCastOp->getOpResult(0),
-                              origTensorDescType.getLayoutAttr());
+    // xegpu::setTemporaryLayout(bitCastOp->getOpResult(0),
+    //                           origTensorDescType.getLayoutAttr());
     rewriter.replaceOp(loadNdOp, bitCastOp);
     return success();
   }

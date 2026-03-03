@@ -1,5 +1,5 @@
 // RUN: mlir-opt --xevm-attach-target='module=xevm_* chip=pvc' -test-xegpu-sg-distribute  \
-// RUN: -allow-unregistered-dialect -canonicalize -cse  %s | FileCheck %s
+// RUN: -allow-unregistered-dialect  -cse  %s | FileCheck %s
 gpu.module @xevm_module{
 // CHECK-LABEL: gpu.func @store_nd_1d
 // CHECK:         (%[[ARG0:[0-9a-zA-Z]+]]: index) {

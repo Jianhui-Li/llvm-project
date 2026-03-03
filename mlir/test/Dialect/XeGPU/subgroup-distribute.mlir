@@ -1,5 +1,5 @@
 // RUN: mlir-opt --xevm-attach-target='module=xevm_* chip=pvc' -xegpu-subgroup-distribute \
-// RUN: -allow-unregistered-dialect -canonicalize -cse -split-input-file %s | FileCheck %s
+// RUN: -allow-unregistered-dialect  -cse -split-input-file %s | FileCheck %s
 
 // CHECK-LABEL: gpu.func @load_dpas_postop_store
 // CHECK:         (%[[ARG0:[0-9a-zA-Z]+]]: memref<8x16xf16>, %[[ARG1:[0-9a-zA-Z]+]]: memref<16x16xf16>,
@@ -350,7 +350,7 @@ gpu.module @xevm_module{
       -> !xegpu.tensor_desc<16x16xf16, #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>>
     %0 = xegpu.load_nd %tdesc0[%c0, %c0] <{layout = #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>}> : !xegpu.tensor_desc<16x16xf16, #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>> -> vector<16x16xf16>
     %1 = vector.multi_reduction <add>, %0, %cst {layout_result_0 = #xegpu.slice<#xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>, dims = [0]>} [0] : vector<16x16xf16> to vector<16xf16>
-    // CHECK: %[[BCAST:.*]] = vector.broadcast %{{.*}} : f16 to vector<16xf16>
+    // CHECK: %[[BCAST:.*]] = vector.broadcast %{{.*}} : vector<1xf16> to vector<16x1xf16>
     %2 = vector.broadcast %1 {layout_result_0 = #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>} : vector<16xf16> to vector<16x16xf16>
     xegpu.store_nd %2, %tdesc1[%c0, %c0] <{layout = #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>}> : vector<16x16xf16>, !xegpu.tensor_desc<16x16xf16, #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>>
     gpu.return
@@ -388,7 +388,7 @@ gpu.module @xevm_module{
     %9 = gpu.block_id  x
     %10 = arith.index_cast %9 : index to i16
     %11 = arith.bitcast %10 : i16 to f16
-    // CHECK: vector.broadcast {{.*}} : f16 to vector<16xf16>
+    // CHECK: vector.broadcast {{.*}} : f16 to vector<16x1xf16>
     %2 = vector.broadcast %11 {layout_result_0 = #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>} : f16 to vector<16x16xf16>
     %tdesc1 = xegpu.create_nd_tdesc %arg1 : memref<16x16xf16>
       -> !xegpu.tensor_desc<16x16xf16, #xegpu.layout<lane_layout = [1, 16], lane_data = [1, 1]>>

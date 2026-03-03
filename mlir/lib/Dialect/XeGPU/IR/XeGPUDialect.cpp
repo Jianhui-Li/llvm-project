@@ -501,6 +501,26 @@ DistributeLayoutAttr LayoutAttr::setDimData(int64_t dim, int64_t sgData,
       getOrder());
 }
 
+/// Converts a sparse order vector into a normalized order vector [0, N-1].
+/// Takes a sparse ordering (e.g., {5, 3, 1, 0}) and returns {3, 2, 1, 0}.
+static SmallVector<int32_t>
+computeOrderFromSparseOrderVec(SmallVector<int32_t> sparseOrderVec) {
+  // say we have sparseOrderVec = {5, 3, 2, 1, 0}
+  // Create indices [0, 1, 2, 3, 4]
+  SmallVector<size_t> indices =
+      llvm::to_vector(llvm::seq<size_t>(0, sparseOrderVec.size()));
+
+  // Sort indices based on corresponding values: [4, 3, 2, 1, 0]
+  // because sparseOrderVec[4] < sparseOrderVec[3] < ...
+  llvm::sort(indices, [&](size_t a, size_t b) {
+    return sparseOrderVec[a] < sparseOrderVec[b];
+  });
+
+  SmallVector<int32_t> newOrder = llvm::to_vector(llvm::map_range(
+      indices, [&](size_t i) { return static_cast<int32_t>(i); }));
+  return newOrder;
+}
+
 // Derive a new layout by collapsing dimensions.
 // `dimGroup` specifies a group of adjacent dimensions
 // that are collapsed into a single dimension in the derived layout.
@@ -525,7 +545,7 @@ DistributeLayoutAttr LayoutAttr::collapseDims(SmallVector<int64_t> dimGroup) {
   int64_t dimBeforeCurrent = -1;
   for (auto dimIdx : sortedDimGroup) {
     // when order is present, adjacency dims are on order values like [3, 2, 1,
-    // 0] in decreasing order otherwise based on dim indices like [0, 1, 2, 3]
+    // 0] in decreasing order; otherwise based on dim indices like [0, 1, 2, 3]
     // in increasing order
     if (dimBeforeCurrent >= 0) {
       if (!orderVec.empty()) {
@@ -586,10 +606,10 @@ DistributeLayoutAttr LayoutAttr::collapseDims(SmallVector<int64_t> dimGroup) {
     laneData.insert(laneData.begin() + firstDim, collapsedLaneData);
   }
 
-  // go through the values inside collapsedOrder, and re-map the order values
-  // to be in range of [0, N-1] where N is the number of dimensions in
-  // collapsed shape for exmaple, collapse dim group {2, 3} of order[1, 2, 3,
-  // 4] to new order[1, 3, 4]. the loop below remaps it to [1, 2, 3].
+  // After collapsing the order vector, re-map the order values to be in range
+  // of [0, N-1] where N is the number of dimensions in collapsed shape. For
+  // exmaple, collapse dim group {2, 3} of order[1, 2, 3, 4] to new order[1, 3,
+  // 4]. the loop below remaps it to [1, 2, 3].
   SmallVector<int32_t> collapsedOrder;
   if (!orderVec.empty()) {
 
@@ -599,16 +619,7 @@ DistributeLayoutAttr LayoutAttr::collapseDims(SmallVector<int64_t> dimGroup) {
                        orderVec.begin() + dimIdx + 1);
     }
 
-    // say we have orderVec = {5, 3, 2, 1, 0}
-    // Create indices [0, 1, 2, 3, 4]
-    SmallVector<size_t> indices =
-        llvm::to_vector(llvm::seq<size_t>(0, orderVec.size()));
-
-    // Sort indices based on corresponding values
-    llvm::sort(indices,
-               [&](size_t a, size_t b) { return orderVec[a] < orderVec[b]; });
-    collapsedOrder = llvm::to_vector(llvm::map_range(
-        indices, [&](size_t i) { return static_cast<int32_t>(i); }));
+    collapsedOrder = computeOrderFromSparseOrderVec(orderVec);
   }
 
   // Create collapsed layout
@@ -633,6 +644,96 @@ DistributeLayoutAttr LayoutAttr::collapseDims(SmallVector<int64_t> dimGroup) {
       collapsedOrder.empty()
           ? DenseI32ArrayAttr()
           : DenseI32ArrayAttr::get(getContext(), collapsedOrder));
+  return collapsedLayout;
+}
+
+// Derive a new layout by removing dimensions.
+// `dimGroup` specifies a group of dimensions to be removed in the derived
+// layout.
+DistributeLayoutAttr LayoutAttr::dropDims(SmallVector<int64_t> dimGroup) {
+
+  SmallVector<int64_t> sgLayout = getEffectiveSgLayoutAsInt();
+  SmallVector<int64_t> sgData = getEffectiveSgDataAsInt();
+  SmallVector<int64_t> instData = getEffectiveInstDataAsInt();
+  SmallVector<int64_t> laneLayout = getEffectiveLaneLayoutAsInt();
+  SmallVector<int64_t> laneData = getEffectiveLaneDataAsInt();
+
+  DenseI32ArrayAttr orderAttr = getOrder();
+  SmallVector<int32_t> orderVec;
+  if (orderAttr && !orderAttr.empty()) {
+    orderVec = llvm::to_vector(
+        llvm::map_range(orderAttr.asArrayRef(),
+                        [](int32_t idx) { return static_cast<int32_t>(idx); }));
+  }
+
+  SmallVector<int64_t> sortedDimGroup = dimGroup;
+  llvm::sort(sortedDimGroup);
+  llvm::dbgs() << "dropDims: dimGroup size = " << dimGroup.size() << "\n";
+  for (auto dim : dimGroup)
+    llvm::dbgs() << "  dim: " << dim << "\n";
+
+  if (!sgLayout.empty()) {
+    for (auto dimIdx : llvm::reverse(sortedDimGroup)) {
+      sgLayout.erase(sgLayout.begin() + dimIdx, sgLayout.begin() + dimIdx + 1);
+      sgData.erase(sgData.begin() + dimIdx, sgData.begin() + dimIdx + 1);
+    }
+  }
+  llvm::dbgs() << "After sgLayout erase, sgLayout size = " << sgLayout.size()
+               << "\n";
+
+  if (!instData.empty()) {
+    for (auto dimIdx : llvm::reverse(sortedDimGroup))
+      instData.erase(instData.begin() + dimIdx, instData.begin() + dimIdx + 1);
+  }
+
+  if (!laneLayout.empty()) {
+    for (auto dimIdx : llvm::reverse(sortedDimGroup)) {
+      laneLayout.erase(laneLayout.begin() + dimIdx,
+                       laneLayout.begin() + dimIdx + 1);
+      laneData.erase(laneData.begin() + dimIdx, laneData.begin() + dimIdx + 1);
+    }
+  }
+
+  // After removing some dims, re-map the order values
+  // to be in range of [0, N-1] where N is the number of remaining dimensions
+  // For exmaple, remove dim group {2, 3} of order[0, 1, 2, 3,
+  // 4] to new order[0, 1, 4]. the loop below remaps it to [0, 1, 2].
+  SmallVector<int32_t> droppedOrder;
+  if (!orderVec.empty()) {
+    llvm::dbgs() << "Before order erase, orderVec size = " << orderVec.size()
+                 << "\n";
+    for (auto dimIdx : llvm::reverse(sortedDimGroup)) {
+      orderVec.erase(orderVec.begin() + dimIdx, orderVec.begin() + dimIdx + 1);
+    }
+    llvm::dbgs() << "After order erase, orderVec size = " << orderVec.size()
+                 << "\n";
+    droppedOrder = computeOrderFromSparseOrderVec(orderVec);
+    llvm::dbgs() << "After recompute, droppedOrder size = "
+                 << droppedOrder.size() << "\n";
+  }
+
+  // Create collapsed layout
+  SmallVector<int32_t> sgLayout32(sgLayout.begin(), sgLayout.end());
+  SmallVector<int32_t> sgData32(sgData.begin(), sgData.end());
+  SmallVector<int32_t> instData32(instData.begin(), instData.end());
+  SmallVector<int32_t> laneLayout32(laneLayout.begin(), laneLayout.end());
+  SmallVector<int32_t> laneData32(laneData.begin(), laneData.end());
+
+  auto collapsedLayout = xegpu::LayoutAttr::get(
+      getContext(),
+      sgLayout32.empty() ? DenseI32ArrayAttr()
+                         : DenseI32ArrayAttr::get(getContext(), sgLayout32),
+      sgData32.empty() ? DenseI32ArrayAttr()
+                       : DenseI32ArrayAttr::get(getContext(), sgData32),
+      instData32.empty() ? DenseI32ArrayAttr()
+                         : DenseI32ArrayAttr::get(getContext(), instData32),
+      laneLayout32.empty() ? DenseI32ArrayAttr()
+                           : DenseI32ArrayAttr::get(getContext(), laneLayout32),
+      laneData32.empty() ? DenseI32ArrayAttr()
+                         : DenseI32ArrayAttr::get(getContext(), laneData32),
+      droppedOrder.empty()
+          ? DenseI32ArrayAttr()
+          : DenseI32ArrayAttr::get(getContext(), droppedOrder));
   return collapsedLayout;
 }
 
@@ -872,6 +973,11 @@ DistributeLayoutAttr SliceAttr::collapseDims(SmallVector<int64_t> dimGroup) {
   // Map the sliced dims from parent space to collapsed space
   SmallVector<int64_t> sliceDims = llvm::to_vector(getDims().asArrayRef());
 
+  assert("expect sliceDims not being collapsed" &&
+         llvm::none_of(dimGroup, [&](int64_t dim) {
+           return llvm::is_contained(sliceDims, dim);
+         }));
+
   SmallVector<int64_t> dimsInParentSpace =
       mapSlicedDimsToParentSpace(dimGroup, sliceDims);
 
@@ -879,6 +985,43 @@ DistributeLayoutAttr SliceAttr::collapseDims(SmallVector<int64_t> dimGroup) {
 
   return SliceAttr::get(getContext(), collapsedParent,
                         DenseI64ArrayAttr::get(getContext(), sliceDims));
+}
+
+// Derive a new layout by removing dimensions.
+// `dimGroup` specifies a group of dimensions to be removed in the derived
+// layout.
+DistributeLayoutAttr SliceAttr::dropDims(SmallVector<int64_t> dimGroup) {
+  // Map the sliced dims from parent space to collapsed space
+  SmallVector<int64_t> sliceDims = llvm::to_vector(getDims().asArrayRef());
+
+  SmallVector<int64_t> dimsInParentSpace =
+      mapSlicedDimsToParentSpace(dimGroup, sliceDims);
+
+  auto droppedParent = getParent().dropDims(dimsInParentSpace);
+
+  // get remaining slice dims after dropping dims in parent layout
+  SmallVector<int64_t> remainingSliceDims;
+  for (int64_t dim : sliceDims) {
+    if (!llvm::is_contained(dimsInParentSpace, dim))
+      remainingSliceDims.push_back(dim);
+  }
+
+  llvm::dbgs() << "SliceAttr::dropDims: sliceDims size = " << sliceDims.size()
+               << "\n";
+  for (auto dim : sliceDims)
+    llvm::dbgs() << "  sliceDim: " << dim << "\n";
+  llvm::dbgs() << "SliceAttr::dropDims: dimsInParentSpace size = "
+               << dimsInParentSpace.size() << "\n";
+  for (auto dim : dimsInParentSpace)
+    llvm::dbgs() << "  dimInParentSpace: " << dim << "\n";
+  llvm::dbgs() << "SliceAttr::dropDims: remainingSliceDims size = "
+               << remainingSliceDims.size() << "\n";
+  for (auto dim : remainingSliceDims)
+    llvm::dbgs() << "  remainingSliceDim: " << dim << "\n";
+
+  return SliceAttr::get(
+      getContext(), droppedParent,
+      DenseI64ArrayAttr::get(getContext(), remainingSliceDims));
 }
 
 //===----------------------------------------------------------------------===//

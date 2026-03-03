@@ -1,5 +1,5 @@
 // RUN: mlir-opt --xevm-attach-target='module=xevm_* chip=pvc'  \
-// RUN:   --xegpu-optimize-peephole --canonicalize --cse --split-input-file %s | FileCheck %s
+// RUN:   --xegpu-optimize-peephole  --cse --split-input-file %s | FileCheck %s
 
 // CHECK-LABEL: gpu.func @no_scf(
 // CHECK-SAME:    %[[ARG0:[0-9a-zA-Z]+]]: memref<64x64xf16>, %{{.*}}: vector<8x16xf16>) -> vector<8x16xf32> {
