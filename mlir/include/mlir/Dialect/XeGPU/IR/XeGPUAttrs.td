@@ -259,6 +259,10 @@ def DistributeLayoutAttr: AttrInterface<"DistributeLayoutAttr"> {
                     "xegpu::DistributeLayoutAttr",
                     "dropDims",
                     (ins "SmallVector<int64_t>": $dimGroup)>,
+    InterfaceMethod<[{Derive a new layout by trasposing it using `permutation`.}],
+                    "xegpu::DistributeLayoutAttr",
+                    "transposeDims",
+                    (ins "ArrayRef<int64_t>": $permutation)>,
     InterfaceMethod<[{Generates instructions to compute multidimensional coordinates for dist units
                       assigned to a level identified by linearId. The shape parameter
                       represents the higher-level problem size. Each level may access
@@ -576,6 +580,9 @@ def XeGPU_LayoutAttr : XeGPUAttr<"Layout", "layout", [DistributeLayoutAttr]> {
     // `dimGroup` specifies a group of dimensions to be removed in the derived layout.
     DistributeLayoutAttr dropDims(SmallVector<int64_t> dimGroup);
 
+    // Derive a new layout by transposing the layout using `permutation`.
+    DistributeLayoutAttr transposeDims(ArrayRef<int64_t> permutation);
+
     /// Delinearizes a linear ID into its multidimensional indices
     /// based on the effective level of the layout.
     FailureOr<SmallVector<Value>>
@@ -779,6 +786,9 @@ def XeGPU_SliceAttr : XeGPUAttr<"Slice", "slice", [DistributeLayoutAttr]> {
     // Derive a new layout by removing dimensions.
     // `dimGroup` specifies a group of dimensions to be removed in the derived layout.
     DistributeLayoutAttr dropDims(SmallVector<int64_t> dimGroup);
+
+    // Derive a new layout by transposing the layout using `permutation`.
+    DistributeLayoutAttr transposeDims(ArrayRef<int64_t> permutation);
 
     /// flatten a nested SliceAttr, e.g., for 2-level nested SliceAttr
     /// #xegpu.slice<#xegpu.slice<#xegpu.layout<sg_layout = [4, 8, 12]>, dims = [0]>, dims = [0]>

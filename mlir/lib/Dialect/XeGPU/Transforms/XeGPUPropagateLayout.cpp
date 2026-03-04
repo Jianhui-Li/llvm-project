@@ -242,7 +242,7 @@ LayoutInfo LayoutInfo::transpose(ArrayRef<int64_t> permutation) const {
   LLVM_DEBUG(llvm::dbgs() << "]\n");
 
   auto orderAttr = DenseI32ArrayAttr::get(storage.getContext(), order);
-// debug pring the order attribute  
+  // debug pring the order attribute
   LLVM_DEBUG(DBGS() << "transpose: orderAttr = [");
   LLVM_DEBUG(for (int val : order) llvm::dbgs() << val << " ");
   LLVM_DEBUG(llvm::dbgs() << "]\n");
@@ -943,15 +943,21 @@ void LayoutInfoPropagation::visitTransposeOp(
   LayoutInfo resultLayout = results[0]->getValue();
   if (!resultLayout.isAssigned())
     return;
+
   LLVM_DEBUG(DBGS() << "visitTransposeOp: result layout = ");
   LLVM_DEBUG(resultLayout.print(llvm::dbgs()));
   LLVM_DEBUG(llvm::dbgs() << "\n");
-  LayoutInfo newLayout = resultLayout.transpose(transpose.getPermutation());
+  // LayoutInfo newLayout = resultLayout.transpose(transpose.getPermutation());
+  auto consumerLayoutAttr =
+      dyn_cast<xegpu::DistributeLayoutAttr>(resultLayout.get());
+  auto srcLayoutAttr = xegpu::inferTransposeSourceLayout(
+      consumerLayoutAttr, transpose.getPermutation());
+
   LLVM_DEBUG(DBGS() << "visitTransposeOp: transposed layout = ");
-  LLVM_DEBUG(newLayout.print(llvm::dbgs()));
+  LLVM_DEBUG(srcLayoutAttr.print(llvm::dbgs()));
   LLVM_DEBUG(llvm::dbgs() << "\n");
   // Propagate the new layout to the vector operand.
-  propagateIfChanged(operands[0], operands[0]->meet(newLayout));
+  propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(srcLayoutAttr)));
 }
 
 /// For vector::BitCastOp, the lane_data of the source layout is changed based
