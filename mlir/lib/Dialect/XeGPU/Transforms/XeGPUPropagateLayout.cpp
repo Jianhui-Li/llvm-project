@@ -215,7 +215,18 @@ LayoutInfo LayoutInfo::transpose(ArrayRef<int64_t> permutation) const {
   SmallVector<int32_t> sgData;
   SmallVector<int32_t> order;
 
+  SmallVector<int32_t> origOrder;
+  if (getOrder().size())
+    origOrder = getOrder();
+  else {
+    SmallVector<int32_t> defaultOrder(permutation.size());
+    std::iota(defaultOrder.rbegin(), defaultOrder.rend(), 0);
+    origOrder = defaultOrder;
+  }
+
+  LLVM_DEBUG(DBGS() << "transpose: permutation = [");
   for (int64_t idx : permutation) {
+    LLVM_DEBUG(llvm::dbgs() << idx << " ");
     if (getLaneLayout().size()) {
       laneLayout.push_back(static_cast<int32_t>(getLaneLayout()[idx]));
       laneData.push_back(static_cast<int32_t>(getLaneData()[idx]));
@@ -226,26 +237,46 @@ LayoutInfo LayoutInfo::transpose(ArrayRef<int64_t> permutation) const {
       sgLayout.push_back(static_cast<int32_t>(getSgLayout()[idx]));
       sgData.push_back(static_cast<int32_t>(getSgData()[idx]));
     }
-    if (getOrder().size()) {
-      order.push_back(static_cast<int32_t>(getOrder()[idx]));
-    }
+    order.push_back(static_cast<int32_t>(origOrder[idx]));
   }
-  auto orderAttr = order.size()
-                       ? DenseI32ArrayAttr::get(storage.getContext(), order)
-                       : nullptr;
+  LLVM_DEBUG(llvm::dbgs() << "]\n");
+
+  auto orderAttr = DenseI32ArrayAttr::get(storage.getContext(), order);
+// debug pring the order attribute  
+  LLVM_DEBUG(DBGS() << "transpose: orderAttr = [");
+  LLVM_DEBUG(for (int val : order) llvm::dbgs() << val << " ");
+  LLVM_DEBUG(llvm::dbgs() << "]\n");
+
   xegpu::LayoutAttr layoutAttr;
-  if (getLaneLayout().size())
-    layoutAttr =
-        xegpu::LayoutAttr::get(storage.getContext(), laneLayout, laneData);
-  if (getInstData().size())
+  if (getLaneLayout().size()) {
+    LLVM_DEBUG(DBGS() << "transpose: creating lane layout\n");
+    LLVM_DEBUG(DBGS() << "transpose: created lane layout with laneLayout=[");
+    LLVM_DEBUG(for (int val : laneLayout) llvm::dbgs() << val << " ");
+    LLVM_DEBUG(llvm::dbgs() << "] laneData=[");
+    LLVM_DEBUG(for (int val : laneData) llvm::dbgs() << val << " ");
+    LLVM_DEBUG(llvm::dbgs() << "]\n");
+
+    layoutAttr = xegpu::LayoutAttr::get(
+      storage.getContext(),
+      /*sg_lane =*/nullptr, /*sg_data =*/nullptr, /*inst_data =*/nullptr,
+      DenseI32ArrayAttr::get(storage.getContext(), laneLayout),
+      DenseI32ArrayAttr::get(storage.getContext(), laneData), orderAttr);
+
+  }
+  if (getInstData().size()) {
+    LLVM_DEBUG(DBGS() << "transpose: creating inst data layout\n");
     layoutAttr = xegpu::LayoutAttr::get(storage.getContext(), instData);
-  if (getSgData().size())
+  }
+  if (getSgData().size()) {
+    LLVM_DEBUG(DBGS() << "transpose: creating subgroup layout\n");
     layoutAttr = xegpu::LayoutAttr::get(
         storage.getContext(),
         DenseI32ArrayAttr::get(storage.getContext(), sgLayout),
         DenseI32ArrayAttr::get(storage.getContext(), sgData),
         /*inst_data =*/nullptr, /*lane_layout =*/nullptr,
         /*lane_data =*/nullptr, orderAttr);
+  }
+  LLVM_DEBUG(DBGS() << "transpose: result layout = " << layoutAttr << "\n");
   return LayoutInfo(layoutAttr);
 }
 
@@ -912,7 +943,13 @@ void LayoutInfoPropagation::visitTransposeOp(
   LayoutInfo resultLayout = results[0]->getValue();
   if (!resultLayout.isAssigned())
     return;
+  LLVM_DEBUG(DBGS() << "visitTransposeOp: result layout = ");
+  LLVM_DEBUG(resultLayout.print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
   LayoutInfo newLayout = resultLayout.transpose(transpose.getPermutation());
+  LLVM_DEBUG(DBGS() << "visitTransposeOp: transposed layout = ");
+  LLVM_DEBUG(newLayout.print(llvm::dbgs()));
+  LLVM_DEBUG(llvm::dbgs() << "\n");
   // Propagate the new layout to the vector operand.
   propagateIfChanged(operands[0], operands[0]->meet(newLayout));
 }

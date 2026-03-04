@@ -204,8 +204,24 @@ xegpu::inferBitCastSourceLayout(xegpu::DistributeLayoutAttr resLayout,
   int64_t laneDataValue = -1;
   int64_t dim = resLayout.getRank() - 1;
 
+  llvm::errs() << "inferBitCastSourceLayout: srcElemTyBitWidth="
+               << srcElemTyBitWidth
+               << ", resElemTyBitWidth=" << resElemTyBitWidth << "\n";
+  llvm::errs() << "  sgData: [";
+  for (auto v : sgData)
+    llvm::errs() << v << " ";
+  llvm::errs() << "], instData: [";
+  for (auto v : instData)
+    llvm::errs() << v << " ";
+  llvm::errs() << "], laneData: [";
+  for (auto v : laneData)
+    llvm::errs() << v << " ";
+  llvm::errs() << "]\n";
+
   if (srcElemTyBitWidth <= resElemTyBitWidth) {
     int bitWidthRatio = resElemTyBitWidth / srcElemTyBitWidth;
+    llvm::errs() << "  Casting to smaller bitwidth, ratio=" << bitWidthRatio
+                 << "\n";
     if (sgDataSize)
       sgDataValue = sgData.back() * bitWidthRatio;
     if (instDataSize)
@@ -214,6 +230,8 @@ xegpu::inferBitCastSourceLayout(xegpu::DistributeLayoutAttr resLayout,
       laneDataValue = laneData.back() * bitWidthRatio;
   } else {
     int bitWidthRatio = srcElemTyBitWidth / resElemTyBitWidth;
+    llvm::errs() << "  Casting to larger bitwidth, ratio=" << bitWidthRatio
+                 << "\n";
     if (sgDataSize) {
       assert((sgData.back() % bitWidthRatio) == 0 &&
              "sgData not divisible by bitWidthRatio");
@@ -230,6 +248,11 @@ xegpu::inferBitCastSourceLayout(xegpu::DistributeLayoutAttr resLayout,
       laneDataValue = laneData.back() / bitWidthRatio;
     }
   }
+
+  llvm::errs() << "  Result: sgDataValue=" << sgDataValue
+               << ", instDataValue=" << instDataValue
+               << ", laneDataValue=" << laneDataValue << ", dim=" << dim
+               << "\n";
 
   xegpu::DistributeLayoutAttr finalSrcLayout;
   finalSrcLayout =
