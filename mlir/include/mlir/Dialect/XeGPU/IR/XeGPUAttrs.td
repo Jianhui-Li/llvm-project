@@ -507,6 +507,8 @@ def XeGPU_LayoutAttr : XeGPUAttr<"Layout", "layout", [DistributeLayoutAttr]> {
       // avoid every field of the attribute is nullptr, which may lead to segment fault
       if (!getInstData() && !getLaneLayout())
         return nullptr;
+      if (!getLaneLayout())
+        return LayoutAttr::get(getContext(),getInstData());
       return LayoutAttr::get(getContext(), nullptr, nullptr, getInstData(),
                              getLaneLayout(), getLaneData(), getOrder());
     }

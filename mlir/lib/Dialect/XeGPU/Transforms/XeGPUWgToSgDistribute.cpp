@@ -625,28 +625,62 @@ struct WgToSgConvertLayoutOp
         targetLayout.getEffectiveSgLayoutAsInt();
     SmallVector<int64_t> targetSgData = targetLayout.getEffectiveSgDataAsInt();
 
+    llvm::dbgs() << "DEBUG: ConvertLayoutOp - Input layout: sg_layout=[";
+    for (auto v : inputSgLayout)
+      llvm::dbgs() << v << " ";
+    llvm::dbgs() << "], sg_data=[";
+    for (auto v : inputSgData)
+      llvm::dbgs() << v << " ";
+    llvm::dbgs() << "]\n";
+    llvm::dbgs() << "DEBUG: ConvertLayoutOp - Target layout: sg_layout=[";
+    for (auto v : targetSgLayout)
+      llvm::dbgs() << v << " ";
+    llvm::dbgs() << "], sg_data=[";
+    for (auto v : targetSgData)
+      llvm::dbgs() << v << " ";
+    llvm::dbgs() << "]\n";
+
     // Fast path: if sg_layout and sg_data are identical, no SLM needed
     if (inputLayout.isCompatibleWith(targetLayout,
                                      xegpu::LayoutKind::Subgroup)) {
+      llvm::dbgs() << "DEBUG: Fast path - Layouts are compatible\n";
       inputLayout = inputLayout.dropSgLayoutAndData();
       targetLayout = targetLayout.dropSgLayoutAndData();
 
       SmallVector<Value> newOps(adaptor.getSource());
+      llvm::dbgs() << "DEBUG: Fast path - Processing "
+                   << adaptor.getSource().size() << " sources\n";
       if (inputLayout && targetLayout) {
         for (auto [i, src] : llvm::enumerate(adaptor.getSource())) {
+          llvm::dbgs() << "DEBUG: Fast path - Converting layout for source "
+                       << i << "\n";
           auto newOp = xegpu::ConvertLayoutOp::create(
               rewriter, loc, src.getType(), src, inputLayout, targetLayout);
           newOps[i] = newOp;
         }
       }
+      llvm::dbgs() << "DEBUG: Fast path taken, created " << newOps.size()
+                   << " ops\n";
       rewriter.replaceOpWithMultiple(op, {newOps});
       return success();
     }
 
+    llvm::dbgs() << "DEBUG: Taking SLM path - layouts differ, need "
+                    "cross-subgroup redistribution\n";
+    llvm::dbgs() << "DEBUG: wgShape=[";
+    for (auto v : wgShape)
+      llvm::dbgs() << v << " ";
+    llvm::dbgs() << "]\n";
+
     // SLM path: layouts differ, need cross-subgroup data redistribution
     Type elemTy = cast<VectorType>(op.getSource().getType()).getElementType();
+    llvm::dbgs() << "DEBUG: Element type: " << elemTy << "\n";
 
     SmallVector<int64_t> slmShape = llvm::to_vector(wgShape);
+    llvm::dbgs() << "DEBUG: Initial slmShape=[";
+    for (auto v : slmShape)
+      llvm::dbgs() << v << " ";
+    llvm::dbgs() << "]\n";
 
     // Calculate SLM size requirements
     auto bitWidth = elemTy.getIntOrFloatBitWidth();

@@ -145,22 +145,20 @@ xegpu::inferBroadcastSourceLayout(xegpu::DistributeLayoutAttr resLayout,
   SmallVector<int64_t> bcastDims;
 
   // Handling broadcast from low-rank to high-rank (e.g., 1D to 2D) case.
-  int dimDiff = resShape.size() - srcShape.size();
-  for (int i = 0; i < dimDiff; i++)
+  size_t dimDiff = resShape.size() - srcShape.size();
+  for (size_t i = 0; i < dimDiff; i++)
     bcastDims.push_back(i);
 
   for (size_t i = 0; i < resShape.size(); i++)
-    if (i < dimDiff || (srcShape[i - dimDiff] == 1) && (resShape[i] != 1))
+    if ((i < dimDiff) || ((srcShape[i - dimDiff] == 1) && (resShape[i] != 1)))
       bcastDims.push_back(i);
 
   auto returnLayout = resLayout.setUnitDimData(bcastDims);
-
   if (dimDiff > 0) {
     SmallVector<int64_t> sliceDims;
     // Adding the missing leading dims
-    for (int i = 0; i < dimDiff; i++)
+    for (size_t i = 0; i < dimDiff; i++)
       sliceDims.push_back(i);
-
     // Create a slice layout for the source
     returnLayout = xegpu::SliceAttr::get(
         resLayout.getContext(), returnLayout,
@@ -1197,6 +1195,14 @@ xegpu::DistributeLayoutAttr xegpu::getConsumerLayoutAt(OpOperand &operand) {
           insertSlice.getSourceVectorType().getShape());
     if (idx == 1)
       return resLayout;
+  }
+  // For vector::TransposeOp, infer source layout from result layout using
+  // permutation..
+  if (auto transpose = dyn_cast<vector::TransposeOp>(op)) {
+    if (!resLayout)
+      return xegpu::DistributeLayoutAttr();
+    return xegpu::inferTransposeSourceLayout(resLayout,
+                                             transpose.getPermutation());
   }
   // For elementwise operations, all operands must have the same layout as the
   // result.
