@@ -427,10 +427,10 @@ class MultiRed2dOpPattern
   matchAndRewrite(vector::MultiDimReductionOp reductionOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto sourceVecType = reductionOp.getSourceVectorType();
-    if (reductionOp.getReductionDims().size() != 2 ||
-        sourceVecType.getRank() != 2)
-      return rewriter.notifyMatchFailure(
-          reductionOp, "Expected 2D multi reduction of a 2D source");
+    // if (reductionOp.getReductionDims().size() != 2 ||
+    //   sourceVecType.getRank() != 2)
+    //   return rewriter.notifyMatchFailure(
+    //     reductionOp, "Expected 2D multi reduction of a 2D source");
     auto resLayout = xegpu::getDistributeLayoutAttr(reductionOp.getResult());
     // Retrieve and order dims for 1D decomposition (prefer intra-lane first).
     auto dims = llvm::to_vector(reductionOp.getReductionDims());
@@ -440,36 +440,65 @@ class MultiRed2dOpPattern
       intraLaneDim = dims[0];
       crossLaneDim = dims[1];
     }
+    DBGS() << "2D Reduction: intraLaneDim=" << intraLaneDim
+           << ", crossLaneDim=" << crossLaneDim << "\n";
     auto loc = reductionOp.getLoc();
     auto acc = reductionOp.getAcc();
 
     // The first reduction's dist attribute does not have the cross lane dim.
-    auto resSliceLayoutAttr = cast<xegpu::SliceAttr>(resLayout);
-    SmallVector<int64_t> dropDims{crossLaneDim};
-    auto intraLaneRedResLayout = resSliceLayoutAttr.dropSliceDims(dropDims);
+    // auto resSliceLayoutAttr = cast<xegpu::SliceAttr>(resLayout);
+    // SmallVector<int64_t> dropDims{crossLaneDim};
+    // auto intraLaneRedResLayout = resSliceLayoutAttr.dropSliceDims(dropDims);
 
     SmallVector<int64_t> accShape(sourceVecType.getShape());
     accShape.erase(accShape.begin() + intraLaneDim);
-    if (acc) {
-      acc = vector::BroadcastOp::create(
-          rewriter, loc,
-          VectorType::get(accShape, sourceVecType.getElementType()), acc);
-      xegpu::setDistributeLayoutAttr(
-          llvm::dyn_cast<OpResult>(acc),
-          cast<xegpu::DistributeLayoutAttr>(intraLaneRedResLayout));
-    }
+    DBGS() << "Accumulator shape after erase: [";
+    for (int64_t dim : accShape)
+      DBGS() << dim << " ";
+    DBGS() << "]\n";
+    // Value acc_interm;
+    // if (acc) {
+    Type eTy = sourceVecType.getElementType();
+    Attribute eVal;
+    if (eTy.isFloat())
+      eVal = FloatAttr::get(eTy, 0.0);
+    else
+      eVal = IntegerAttr::get(eTy, 0);
+    Value const_zero = arith::ConstantOp::create(
+        rewriter, loc,
+        DenseElementsAttr::get(VectorType::get(accShape, eTy), eVal));
+    // acc_interm = arith::ConstantOp::create(
+    //   rewriter, loc,
+    //   VectorType::get(accShape, sourceVecType.getElementType()), 0);
+    // xegpu::setDistributeLayoutAttr(
+    //   llvm::dyn_cast<OpResult>(acc_interm),
+    //   cast<xegpu::DistributeLayoutAttr>(intraLaneRedResLayout));
+    // }
     Value intraLaneReduced = vector::MultiDimReductionOp::create(
-        rewriter, loc, reductionOp.getKind(), reductionOp.getSource(), acc,
-        ArrayRef<int64_t>(intraLaneDim));
-    xegpu::setDistributeLayoutAttr(
-        llvm::dyn_cast<OpResult>(intraLaneReduced),
-        cast<xegpu::DistributeLayoutAttr>(intraLaneRedResLayout));
+        rewriter, loc, reductionOp.getKind(), reductionOp.getSource(),
+        const_zero, ArrayRef<int64_t>(intraLaneDim));
+    DBGS() << "Intra-lane reduction created\n";
+    // print out intraLaneReduced op
+    DBGS() << intraLaneReduced << "\n";
+    // xegpu::setDistributeLayoutAttr(
+    //     llvm::dyn_cast<OpResult>(intraLaneReduced),
+    //     cast<xegpu::DistributeLayoutAttr>(intraLaneRedResLayout));
+    // print out acc, crossLaneDim
+    DBGS() << "Accumulator: " << acc << "\n";
+    DBGS() << "Cross lane dim: " << crossLaneDim << "\n";
+    if (crossLaneDim > intraLaneDim)
+      crossLaneDim -= 1; // Adjust crossLaneDim after the first reduction.
+    Value crossLaneReduced = vector::MultiDimReductionOp::create(
+        rewriter, loc, reductionOp.getKind(), intraLaneReduced, acc,
+        ArrayRef<int64_t>(crossLaneDim));
 
-    Value crossLaneReduced = vector::ReductionOp::create(
-        rewriter, loc, reductionOp.getKind(), intraLaneReduced, nullptr);
-    xegpu::setDistributeLayoutAttr(
-        llvm::dyn_cast<OpResult>(crossLaneReduced),
-        cast<xegpu::DistributeLayoutAttr>(resLayout));
+    // Value crossLaneReduced = vector::ReductionOp::create(
+    //   rewriter, loc, reductionOp.getKind(), intraLaneReduced, nullptr);
+    DBGS() << "Cross-lane reduction created\n";
+    DBGS() << crossLaneReduced << "\n";
+    // xegpu::setDistributeLayoutAttr(
+    //     llvm::dyn_cast<OpResult>(crossLaneReduced),
+    //     cast<xegpu::DistributeLayoutAttr>(resLayout));
     assert(crossLaneReduced.getType() == reductionOp.getResult().getType() &&
            "Type mismatch");
     rewriter.replaceOp(reductionOp, crossLaneReduced);
