@@ -604,6 +604,18 @@ struct XeGPUPeepHoleOptimizerPass final
     MLIRContext *ctx = &getContext();
     RewritePatternSet emptyPatterns(ctx);
     (void)applyPatternsGreedily(getOperation(), std::move(emptyPatterns));
+
+    //remove the temporary layout after all patterns are applied.
+    getOperation()->walk([](Operation *op) {
+      SmallVector<StringAttr> attrsToRemove;
+      for (auto namedAttr : op->getDiscardableAttrs()) {
+        if (isa<xegpu::DistributeLayoutAttr>(namedAttr.getValue()))
+          attrsToRemove.push_back(namedAttr.getName());
+      }
+      for (auto attrName : attrsToRemove)
+        op->removeDiscardableAttr(attrName);
+    });
+
   }
 };
 

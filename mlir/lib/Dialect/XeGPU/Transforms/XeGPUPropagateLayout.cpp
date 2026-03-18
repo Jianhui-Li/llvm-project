@@ -704,10 +704,8 @@ void LayoutInfoPropagation::visitVectorMultiReductionOp(
                      operands[1]->meet(LayoutInfo(requiredResLayoutAttr)));
 }
 
-
 void LayoutInfoPropagation::visitVectorReductionOp(
-    vector::ReductionOp reduction,
-    ArrayRef<LayoutInfoLattice *> operands,
+    vector::ReductionOp reduction, ArrayRef<LayoutInfoLattice *> operands,
     ArrayRef<const LayoutInfoLattice *> results) {
   // The layout of the result must be present.
 
@@ -720,8 +718,8 @@ void LayoutInfoPropagation::visitVectorReductionOp(
   if (!uArch)
     return;
 
-  auto requiredResLayoutAttr = xegpu::setupReductionResultLayout(
-      layoutKind, sourceTy, uArch);
+  auto requiredResLayoutAttr =
+      xegpu::setupReductionResultLayout(layoutKind, sourceTy, uArch);
 
   LLVM_DEBUG(DBGS() << "  requiredResLayoutAttr: " << requiredResLayoutAttr
                     << "\n");
@@ -729,15 +727,17 @@ void LayoutInfoPropagation::visitVectorReductionOp(
   xegpu::setTemporaryLayout(reduction->getResult(0), requiredResLayoutAttr);
 
   // derive the source layout from the dominant layout and reduction dims
-  auto srcLayoutAttr = xegpu::inferReductionSourceLayout(
-      requiredResLayoutAttr);
+  auto srcLayoutAttr = xegpu::inferReductionSourceLayout(requiredResLayoutAttr);
 
   LLVM_DEBUG(DBGS() << "  srcLayoutAttr: " << srcLayoutAttr << "\n");
 
   propagateIfChanged(operands[0], operands[0]->meet(LayoutInfo(srcLayoutAttr)));
-  // Accumulator should have the same layout as the result.
-  propagateIfChanged(operands[1],
-                     operands[1]->meet(LayoutInfo(requiredResLayoutAttr)));
+
+  if (reduction.getAcc()) {
+    // Accumulator should have the same layout as the result.
+    propagateIfChanged(operands[1],
+                       operands[1]->meet(LayoutInfo(requiredResLayoutAttr)));
+  }
 }
 
 void LayoutInfoPropagation::visitVectorBroadCastOp(

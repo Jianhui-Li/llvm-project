@@ -1220,11 +1220,42 @@ struct SinkUniformOps final : public gpu::WarpDistributionPattern {
     // The op must have no layout-based operands or results.
     bool uniformValuesOnly =
         llvm::all_of(warpRegionPreYieldOp->getResults(), [](Value v) {
-          return !xegpu::getDistributeLayoutAttr(v);
+          xegpu::DistributeLayoutAttr layout =
+              xegpu::getDistributeLayoutAttr(v);
+          // if the value is int or fp, return true;
+          if (v.getType().isIntOrFloat() || !layout)
+            return true;
+          VectorType vecTy = dyn_cast<VectorType>(v.getType());
+          if (vecTy) {
+            FailureOr<VectorType> sourceDistTypeOrFailure =
+                getDistVecTypeBasedOnLaneLayout(layout, vecTy);
+            VectorType sourceDistType;
+            if (succeeded(sourceDistTypeOrFailure))
+              sourceDistType = sourceDistTypeOrFailure.value();
+            if (sourceDistType == vecTy)
+              return true;
+          }
+          return false;
         });
     uniformValuesOnly &=
         llvm::all_of(warpRegionPreYieldOp->getOpOperands(), [](OpOperand &opr) {
-          return !xegpu::getDistributeLayoutAttr(opr);
+          Value v = opr.get();
+          xegpu::DistributeLayoutAttr layout =
+              xegpu::getDistributeLayoutAttr(opr);
+          // if the value is int or fp, return true;
+          if (v.getType().isIntOrFloat() || !layout)
+            return true;
+          VectorType vecTy = dyn_cast<VectorType>(v.getType());
+          if (vecTy) {
+            FailureOr<VectorType> sourceDistTypeOrFailure =
+                getDistVecTypeBasedOnLaneLayout(layout, vecTy);
+            VectorType sourceDistType;
+            if (succeeded(sourceDistTypeOrFailure))
+              sourceDistType = sourceDistTypeOrFailure.value();
+            if (sourceDistType == vecTy)
+              return true;
+          }
+          return false;
         });
     if (!uniformValuesOnly)
       return rewriter.notifyMatchFailure(warpOp,
@@ -1423,6 +1454,85 @@ struct VectorMultiReductionDistribution : public gpu::WarpDistributionPattern {
         reductionOp.getKind(), reductionDim, reductionOp.getLoc(), rewriter);
     // Replace the warp op result with the final result.
     rewriter.replaceAllUsesWith(reductionOp.getResult(), result);
+    return success();
+  }
+};
+
+struct VectorReductionDistribution : public gpu::WarpDistributionPattern {
+  using gpu::WarpDistributionPattern::WarpDistributionPattern;
+  LogicalResult matchAndRewrite(gpu::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override {
+    OpOperand *yieldOperand =
+        getWarpResult(warpOp, llvm::IsaPred<vector::ReductionOp>);
+    if (!yieldOperand)
+      return failure();
+
+    auto reductionOp =
+        cast<vector::ReductionOp>(yieldOperand->get().getDefiningOp());
+    auto vectorType = cast<VectorType>(reductionOp.getVector().getType());
+    // Only rank 1 vectors supported.
+    if (vectorType.getRank() != 1)
+      return rewriter.notifyMatchFailure(
+          warpOp, "Only rank 1 reductions can be distributed.");
+    // The vector size must be a multiple of the warp size, or the warp size
+    // must be a multiple of the vector size (fraction case).
+    int64_t vecSize = vectorType.getShape()[0];
+    if (vecSize % warpOp.getWarpSize() != 0 &&
+        warpOp.getWarpSize() % vecSize != 0)
+      return rewriter.notifyMatchFailure(
+          warpOp, "Reduction vector dimension must be a multiple of or evenly "
+                  "divide the warp size.");
+    if (!reductionOp.getType().isIntOrFloat())
+      return rewriter.notifyMatchFailure(
+          warpOp, "Reduction distribution currently only supports floats and "
+                  "integer types.");
+
+    VectorType sourceType = reductionOp.getSourceVectorType();
+    xegpu::DistributeLayoutAttr sourceLayout =
+        xegpu::getTemporaryLayout(reductionOp->getOpOperand(0));
+    FailureOr<VectorType> sourceDistTypeOrFailure =
+        getDistVecTypeBasedOnLaneLayout(sourceLayout, sourceType);
+    if (failed(sourceDistTypeOrFailure))
+      return rewriter.notifyMatchFailure(
+          warpOp, "Failed to distribute the source vector type.");
+    VectorType sourceDistType = sourceDistTypeOrFailure.value();
+
+    // When vecSize >= warpSize, each lane gets vecSize/warpSize elements.
+    // When vecSize < warpSize (fraction case), only vecSize lanes participate
+    // and each gets 1 element.
+    // int64_t numElements =
+    //     vecSize >= warpOp.getWarpSize() ? vecSize / warpOp.getWarpSize() : 1;
+    int64_t activeWarpSize =
+        vecSize >= warpOp.getWarpSize() ? warpOp.getWarpSize() : vecSize;
+    // Return vector that will be reduced from the WarpExecuteOnLane0Op.
+    unsigned operandIndex = yieldOperand->getOperandNumber();
+    SmallVector<Value> yieldValues = {reductionOp.getVector()};
+    SmallVector<Type> retTypes;
+    retTypes.push_back(sourceDistType);
+    if (reductionOp.getAcc()) {
+      yieldValues.push_back(reductionOp.getAcc());
+      retTypes.push_back(reductionOp.getAcc().getType());
+    }
+
+    SmallVector<size_t> newRetIndices;
+    auto newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+        rewriter, warpOp, yieldValues, retTypes, newRetIndices);
+    rewriter.setInsertionPointAfter(newWarpOp);
+
+    // Obtain data to reduce for a single lane.
+    Value laneValVec = newWarpOp.getResult(newRetIndices[0]);
+    // Distribute and reduce across threads. When the vector is a fraction
+    // of the warp size, pass the vector size so only participating lanes
+    // are involved in the distributed reduction.
+    Value fullReduce =
+        xegpu::subgroupReduction(reductionOp.getLoc(), rewriter, laneValVec,
+                                 reductionOp.getKind(), activeWarpSize);
+    if (reductionOp.getAcc()) {
+      fullReduce = vector::makeArithReduction(
+          rewriter, reductionOp.getLoc(), reductionOp.getKind(), fullReduce,
+          newWarpOp.getResult(newRetIndices[1]));
+    }
+    rewriter.replaceAllUsesWith(newWarpOp.getResult(operandIndex), fullReduce);
     return success();
   }
 };
@@ -2105,15 +2215,16 @@ struct XeGPUSubgroupDistributePass final
 
 void xegpu::populateXeGPUSubgroupDistributePatterns(
     RewritePatternSet &patterns) {
-  patterns.add<CreateNdDescDistribution, StoreNdDistribution,
-               LoadNdDistribution, DpasDistribution, PrefetchNdDistribution,
-               GpuBarrierDistribution, VectorMultiReductionDistribution,
-               LoadDistribution, StoreDistribution, VectorTransposeDistribution,
-               VectorBitcastDistribution, LoadMatrixDistribution,
-               StoreMatrixDistribution, ConvertLayoutDistribution,
-               MemrefExtractAlignedPointerAsIndexDistribution>(
-      patterns.getContext(),
-      /*pattern benefit=*/PatternHierarchy::Regular);
+  patterns
+      .add<CreateNdDescDistribution, StoreNdDistribution, LoadNdDistribution,
+           DpasDistribution, PrefetchNdDistribution, GpuBarrierDistribution,
+           VectorMultiReductionDistribution, VectorReductionDistribution,
+           LoadDistribution, StoreDistribution, VectorTransposeDistribution,
+           VectorBitcastDistribution, LoadMatrixDistribution,
+           StoreMatrixDistribution, ConvertLayoutDistribution,
+           MemrefExtractAlignedPointerAsIndexDistribution>(
+          patterns.getContext(),
+          /*pattern benefit=*/PatternHierarchy::Regular);
   // For following patterns, we need to override the regular vector distribution
   // patterns. Therefore, assign higher benefit.
   patterns
