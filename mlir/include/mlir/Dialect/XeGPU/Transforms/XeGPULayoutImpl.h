@@ -82,6 +82,11 @@ DistributeLayoutAttr
 inferMultiReductionSourceLayout(DistributeLayoutAttr resLayout,
                                 SmallVector<int64_t> reduceDims);
 
+/// Infers the source layout attribute for a reduction operation given the
+/// result layout attribute and reduced dims.
+DistributeLayoutAttr
+inferReductionSourceLayout(DistributeLayoutAttr resLayout);
+
 /// Infers the source layout attribute for a transpose operation given the
 /// result layout attribute and permutation.
 DistributeLayoutAttr inferTransposeSourceLayout(DistributeLayoutAttr resLayout,
@@ -120,6 +125,10 @@ SliceAttr setupMultiReductionResultLayout(LayoutKind layoutKind,
                                           VectorType srcVectorTy,
                                           DistributeLayoutAttr consumerLayout,
                                           SmallVector<int64_t> reductionDims,
+                                          const uArch::uArch *uArch);
+
+SliceAttr setupReductionResultLayout(LayoutKind layoutKind,
+                                          VectorType srcVectorTy,
                                           const uArch::uArch *uArch);
 
 /// Setup the result layout attribute for a bitcast operation based on element

@@ -1042,9 +1042,13 @@ struct UnrollConvertLayoutOp : public UnrollPattern<xegpu::ConvertLayoutOp> {
   LogicalResult matchAndRewrite(xegpu::ConvertLayoutOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    VectorType valueTy = llvm::dyn_cast<VectorType>(op.getType());
-    assert(valueTy && "the value type must be vector type!");
+    Type resTy = op.getType();
+    if (!llvm::isa<VectorType>(resTy)) {
+      rewriter.replaceOp(op, op.getOperand());
+      return success();
+    }
 
+    VectorType valueTy = llvm::dyn_cast<VectorType>(resTy);
     std::optional<SmallVector<int64_t>> targetShape = getTargetShape(op);
     if (!targetShape || targetShape->size() != (size_t)valueTy.getRank())
       return failure();

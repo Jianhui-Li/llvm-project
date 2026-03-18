@@ -608,8 +608,10 @@ struct WgToSgConvertLayoutOp
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
 
-    VectorType resultType = op.getResult().getType();
-    ArrayRef<int64_t> wgShape = resultType.getShape();
+    Type resultType = op.getResult().getType();
+    ArrayRef<int64_t> wgShape;
+    if (isa<VectorType>(resultType))
+       wgShape = cast<VectorType>(resultType).getShape();
     auto inputLayout = op.getInputLayout();
     auto targetLayout = op.getTargetLayout();
 
@@ -1198,6 +1200,60 @@ struct WgToSgVectorShapeCastOp
   }
 };
 
+/// Create a scalar neutral value for the given combining kind and element type.
+static Value createScalarNeutralValue(ConversionPatternRewriter &rewriter,
+                                      Location loc, Type elemTy,
+                                      vector::CombiningKind kind) {
+  switch (kind) {
+  case vector::CombiningKind::ADD:
+  case vector::CombiningKind::XOR:
+  case vector::CombiningKind::OR:
+  case vector::CombiningKind::MAXUI:
+    return arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(elemTy));
+  case vector::CombiningKind::MUL:
+  case vector::CombiningKind::AND:
+    return arith::ConstantOp::create(rewriter, loc, rewriter.getOneAttr(elemTy));
+  case vector::CombiningKind::MINSI:
+    if (auto intTy = dyn_cast<IntegerType>(elemTy))
+      return arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(
+              elemTy, APInt::getSignedMaxValue(intTy.getWidth())));
+    return nullptr;
+  case vector::CombiningKind::MINUI:
+    if (auto intTy = dyn_cast<IntegerType>(elemTy))
+      return arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(elemTy,
+                                  APInt::getMaxValue(intTy.getWidth())));
+    return nullptr;
+  case vector::CombiningKind::MAXSI:
+    if (auto intTy = dyn_cast<IntegerType>(elemTy))
+      return arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getIntegerAttr(
+              elemTy, APInt::getSignedMinValue(intTy.getWidth())));
+    return nullptr;
+  case vector::CombiningKind::MINNUMF:
+  case vector::CombiningKind::MINIMUMF:
+    if (auto floatTy = dyn_cast<FloatType>(elemTy))
+      return arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getFloatAttr(
+              elemTy, APFloat::getInf(floatTy.getFloatSemantics())));
+    return nullptr;
+  case vector::CombiningKind::MAXNUMF:
+  case vector::CombiningKind::MAXIMUMF:
+    if (auto floatTy = dyn_cast<FloatType>(elemTy))
+      return arith::ConstantOp::create(
+          rewriter, loc,
+          rewriter.getFloatAttr(
+              elemTy, APFloat::getInf(floatTy.getFloatSemantics(), true)));
+    return nullptr;
+  }
+  return nullptr;
+}
+
 static Value createAccumulator(ConversionPatternRewriter &rewriter,
                                Location loc, VectorType type,
                                vector::CombiningKind kind) {
@@ -1320,13 +1376,13 @@ struct WgToSgMultiDimReductionOp
     Location loc = op.getLoc();
 
     VectorType srcType = op.getSourceVectorType();
-    VectorType dstType = dyn_cast<VectorType>(op.getResult().getType());
-    if (!dstType)
-      return failure();
+    Type resultTy = op.getResult().getType();
+    VectorType dstVecType = dyn_cast<VectorType>(resultTy);
+    bool isScalarResult = !dstVecType;
 
     auto originalSrcShape = srcType.getShape();
-    auto originalDstShape = dstType.getShape();
     int srcVecRank = originalSrcShape.size();
+    Type elemTy = srcType.getElementType();
 
     xegpu::DistributeLayoutAttr layout =
         xegpu::getTemporaryLayout(dyn_cast<OpResult>(op.getResult()));
@@ -1345,25 +1401,38 @@ struct WgToSgMultiDimReductionOp
       return rewriter.notifyMatchFailure(
           op, "Reduction should have SliceAttr layout");
 
-    Type elemTy = dstType.getElementType();
-
-    // Step 1: perform local subgroup reductions with ZERO accumulator
+    // Step 1: perform local subgroup reductions with neutral accumulator
     SmallVector<Value> localReductions;
-    SmallVector<int64_t> sgDstShape =
-        getSgShapeAndCount(originalDstShape, layout).first;
     auto sgSrcs = adaptor.getSource();
     auto sgSrcType = dyn_cast<VectorType>(sgSrcs.front().getType());
     SmallVector<int64_t> sgSrcShape(sgSrcType.getShape().begin(),
                                     sgSrcType.getShape().end());
 
-    VectorType newDstType = VectorType::get(sgDstShape, elemTy);
+    // Determine the SG-level destination type.
+    // For scalar results (all dims reduced), the sg result is also scalar.
+    // For vector results, compute the sg destination shape from layout.
+    Type sgDstType;
+    if (dstVecType) {
+      auto originalDstShape = dstVecType.getShape();
+      SmallVector<int64_t> sgDstShape =
+          getSgShapeAndCount(originalDstShape, layout).first;
+      sgDstType = VectorType::get(sgDstShape, elemTy);
+    } else {
+      sgDstType = elemTy;
+    }
+
     for (auto sgSrc : sgSrcs) {
-      // Create ZERO accumulator for local reduction
-      auto neutralLocalAcc =
-          createAccumulator(rewriter, loc, newDstType, op.getKind());
-      // Local reduction with ZERO accumulator
+      // Create neutral accumulator for local reduction
+      Value neutralLocalAcc;
+      if (auto vecDstTy = dyn_cast<VectorType>(sgDstType))
+        neutralLocalAcc =
+            createAccumulator(rewriter, loc, vecDstTy, op.getKind());
+      else
+        neutralLocalAcc =
+            createScalarNeutralValue(rewriter, loc, elemTy, op.getKind());
+      // Local reduction with neutral accumulator
       auto localReduce = vector::MultiDimReductionOp::create(
-          rewriter, loc, newDstType, op.getKind(), sgSrc, neutralLocalAcc,
+          rewriter, loc, sgDstType, op.getKind(), sgSrc, neutralLocalAcc,
           reductionDims);
       localReductions.push_back(localReduce.getResult());
     }
@@ -1393,12 +1462,22 @@ struct WgToSgMultiDimReductionOp
     }
 
     // Step 2: cross-subgroup reduction using SLM
+    // Prepare the data shape for SLM store: collapse reduction dims to 1.
     auto slmStoreDataShape = sgSrcShape;
     for (int64_t dim : reductionDims)
       slmStoreDataShape[dim] = 1;
     VectorType slmStoreDataType = VectorType::get(slmStoreDataShape, elemTy);
-    Value slmStoreData = vector::ShapeCastOp::create(
-        rewriter, loc, slmStoreDataType, localReductions[0]);
+    Value slmStoreData;
+    if (isScalarResult) {
+      // Scalar result: broadcast scalar to vector<1x...x1> for SLM store
+      slmStoreData = vector::BroadcastOp::create(rewriter, loc,
+                                                  slmStoreDataType,
+                                                  localReductions[0]);
+    } else {
+      slmStoreData = vector::ShapeCastOp::create(rewriter, loc,
+                                                  slmStoreDataType,
+                                                  localReductions[0]);
+    }
 
     SmallVector<int64_t> slmShape(originalSrcShape.begin(),
                                   originalSrcShape.end());
@@ -1480,12 +1559,17 @@ struct WgToSgMultiDimReductionOp
         rewriter, loc, slmLoadType, memDesc.getResult(), slmLoadOffsets,
         /*layout=*/nullptr);
 
-    // Step 6: Perform final reduction with ZERO accumulator
-    auto neutralFinalAcc =
-        createAccumulator(rewriter, loc, newDstType, op.getKind());
+    // Step 6: Perform final reduction with neutral accumulator
+    Value neutralFinalAcc;
+    if (auto vecDstTy = dyn_cast<VectorType>(sgDstType))
+      neutralFinalAcc =
+          createAccumulator(rewriter, loc, vecDstTy, op.getKind());
+    else
+      neutralFinalAcc =
+          createScalarNeutralValue(rewriter, loc, elemTy, op.getKind());
 
     auto finalReduce = vector::MultiDimReductionOp::create(
-        rewriter, loc, newDstType, op.getKind(), slmLoadOp.getResult(),
+        rewriter, loc, sgDstType, op.getKind(), slmLoadOp.getResult(),
         neutralFinalAcc, reductionDims);
 
     // Step 7: Add the original accumulator at the end

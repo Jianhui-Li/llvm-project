@@ -381,26 +381,58 @@ struct UnrollMultiReductionPattern
 
   LogicalResult matchAndRewrite(vector::MultiDimReductionOp reductionOp,
                                 PatternRewriter &rewriter) const override {
-    auto resultType = reductionOp->getResult(0).getType();
-    if (resultType.isIntOrFloat()) {
-      return rewriter.notifyMatchFailure(reductionOp,
-                                         "Unrolling scalars is not supported");
-    }
     std::optional<SmallVector<int64_t>> targetShape =
         getTargetShape(options, reductionOp);
     if (!targetShape)
       return failure();
     SmallVector<int64_t> originalSize = *reductionOp.getShapeForUnroll();
+    Location loc = reductionOp.getLoc();
+    auto resultType = reductionOp->getResult(0).getType();
+
+    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] UnrollMultiReduction: "
+                            << reductionOp << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  originalSize: "
+                            << llvm::interleaved(originalSize) << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  targetShape: "
+                            << llvm::interleaved(*targetShape) << "\n");
+
+    // Handle scalar result case: all dimensions are reduced.
+    // Each source tile is reduced to a scalar, and partial results are
+    // chained through the accumulator operand.
+    if (resultType.isIntOrFloat()) {
+      LLVM_DEBUG(llvm::dbgs() << "  scalar result, chaining reductions\n");
+      Value accumulator = reductionOp.getAcc();
+      for (SmallVector<int64_t> offsets :
+           StaticTileOffsetRange(originalSize, *targetShape)) {
+        LLVM_DEBUG(llvm::dbgs() << "  tile offsets: "
+                                << llvm::interleaved(offsets) << "\n");
+        SmallVector<int64_t> operandStrides(offsets.size(), 1);
+        Value slicedOperand =
+            rewriter.createOrFold<vector::ExtractStridedSliceOp>(
+                loc, reductionOp.getSource(), offsets, *targetShape,
+                operandStrides);
+        Operation *newOp = cloneOpWithOperandsAndTypes(
+            rewriter, loc, reductionOp, {slicedOperand, accumulator},
+            resultType);
+        accumulator = newOp->getResult(0);
+      }
+      rewriter.replaceOp(reductionOp, accumulator);
+      return success();
+    }
+
+    // Vector result case.
     llvm::MapVector<
         SmallVector<int64_t>, Value,
         llvm::DenseMap<SmallVector<int64_t>, unsigned, OffsetMapInfo>>
         accCache;
-    Location loc = reductionOp.getLoc();
+   // Location loc = reductionOp.getLoc();
 
     // Stride of the ratios, this gives us the offsets of sliceCount in a basis
     // of multiples of the targetShape.
     for (SmallVector<int64_t> offsets :
          StaticTileOffsetRange(originalSize, *targetShape)) {
+      LLVM_DEBUG(llvm::dbgs() << "  tile offsets: "
+                              << llvm::interleaved(offsets) << "\n");
       SmallVector<Value> operands;
       SmallVector<int64_t> operandStrides(offsets.size(), 1);
       Value slicedOperand =
@@ -416,25 +448,35 @@ struct UnrollMultiReductionPattern
           dstShape.push_back((*targetShape)[i]);
         }
       }
+      LLVM_DEBUG(llvm::dbgs() << "    dstShape: "
+                              << llvm::interleaved(dstShape)
+                              << ", destOffset: "
+                              << llvm::interleaved(destOffset) << "\n");
       Value acc;
       SmallVector<int64_t> accStrides(destOffset.size(), 1);
       // If a version of the accumulator has already been computed, use it
       // otherwise extract the first version from the original operand.
       auto *accIt = accCache.find(destOffset);
-      if (accIt != accCache.end())
+      if (accIt != accCache.end()) {
         acc = accIt->second;
-      else
+        LLVM_DEBUG(llvm::dbgs() << "    using cached acc\n");
+      } else {
         acc = rewriter.createOrFold<vector::ExtractStridedSliceOp>(
             loc, reductionOp.getAcc(), destOffset, dstShape, accStrides);
+        LLVM_DEBUG(llvm::dbgs() << "    extracted fresh acc\n");
+      }
       operands.push_back(acc);
       auto targetType = VectorType::get(
           dstShape, reductionOp.getSourceVectorType().getElementType());
+      LLVM_DEBUG(llvm::dbgs() << "    targetType: " << targetType << "\n");
       Operation *newOp = cloneOpWithOperandsAndTypes(rewriter, loc, reductionOp,
                                                      operands, targetType);
       Value result = newOp->getResult(0);
       accCache[destOffset] = result;
     }
     // Assemble back the accumulator into a single vector.
+    LLVM_DEBUG(llvm::dbgs() << "  assembling " << accCache.size()
+                            << " cached results\n");
     Value result = arith::ConstantOp::create(
         rewriter, loc, reductionOp.getDestType(),
         rewriter.getZeroAttr(reductionOp.getDestType()));

@@ -24,9 +24,13 @@
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <cstdint>
 #include <numeric>
+
+#define DEBUG_TYPE "xegpu-layout-impl"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 
 using namespace mlir;
 
@@ -181,6 +185,11 @@ xegpu::inferMultiReductionSourceLayout(xegpu::DistributeLayoutAttr resLayout,
          "reduction dims must match with slice dims");
 
   return sliceLayout.getParent();
+}
+
+xegpu::DistributeLayoutAttr
+xegpu::inferReductionSourceLayout(xegpu::DistributeLayoutAttr resLayout) {
+  return xegpu::inferMultiReductionSourceLayout(resLayout, {0});
 }
 
 /// Infers the source layout attribute for a transpose operation given the
@@ -427,6 +436,15 @@ xegpu::SliceAttr xegpu::setupMultiReductionResultLayout(
   int srcRank = srcShape.size();
   auto context = consumerLayout.getContext();
 
+  LLVM_DEBUG(DBGS() << "setupMultiReductionResultLayout:\n");
+  LLVM_DEBUG(DBGS() << "  srcShape: [";
+             llvm::interleaveComma(srcShape, llvm::dbgs());
+             llvm::dbgs() << "]\n");
+  LLVM_DEBUG(DBGS() << "  reductionDims: [";
+             llvm::interleaveComma(reductionDims, llvm::dbgs());
+             llvm::dbgs() << "]\n");
+  LLVM_DEBUG(DBGS() << "  consumerLayout: " << consumerLayout << "\n");
+
   // Reduction layout requires at least 2D tensors
   if (srcRank < 2)
     return nullptr;
@@ -459,6 +477,12 @@ xegpu::SliceAttr xegpu::setupMultiReductionResultLayout(
     int remainingSgCount = workgroupSize;
     int consumerIdx = consumerSgLayout.size() - 1;
 
+    LLVM_DEBUG(DBGS() << "  Subgroup layout: workgroupSize=" << workgroupSize
+                      << ", remainingSgCount=" << remainingSgCount << "\n");
+    LLVM_DEBUG(DBGS() << "  consumerSgLayout: [";
+               llvm::interleaveComma(consumerSgLayout, llvm::dbgs());
+               llvm::dbgs() << "]\n");
+
     // First pass: Match consumer's layout on non-reduction dimensions
     for (int i = srcRank - 1; i >= 0; i--) {
       if (!llvm::is_contained(reductionDims, i) && consumerIdx >= 0) {
@@ -470,9 +494,15 @@ xegpu::SliceAttr xegpu::setupMultiReductionResultLayout(
         consumerIdx--;
       }
     }
+    LLVM_DEBUG(DBGS() << "  After first pass (non-reduction): sgLayout=[";
+               llvm::interleaveComma(sgLayout, llvm::dbgs());
+               llvm::dbgs() << "], sgData=[";
+               llvm::interleaveComma(sgData, llvm::dbgs());
+               llvm::dbgs()
+               << "], remainingSgCount=" << remainingSgCount << "\n");
 
     // Second pass: Distribute remaining subgroups across reduction dimensions
-    for (int i = srcRank - 1; i >= 0; i--) {
+    for (int i = 0; i < srcRank; i++) {
       if (llvm::is_contained(reductionDims, i)) {
         sgLayout[i] =
             std::min(srcShape[i], static_cast<int64_t>(remainingSgCount));
@@ -482,6 +512,12 @@ xegpu::SliceAttr xegpu::setupMultiReductionResultLayout(
         remainingSgCount /= sgLayout[i];
       }
     }
+    LLVM_DEBUG(DBGS() << "  After second pass (reduction): sgLayout=[";
+               llvm::interleaveComma(sgLayout, llvm::dbgs());
+               llvm::dbgs() << "], sgData=[";
+               llvm::interleaveComma(sgData, llvm::dbgs());
+               llvm::dbgs()
+               << "], remainingSgCount=" << remainingSgCount << "\n");
 
     assert(remainingSgCount == 1 && "not all subgroups distributed");
     srcLayout = xegpu::LayoutAttr::get(
@@ -494,7 +530,8 @@ xegpu::SliceAttr xegpu::setupMultiReductionResultLayout(
     SmallVector<int64_t> instData(srcRank, 1);
     instData[srcRank - 2] =
         std::min(maxReduceVectorSize, srcShape[srcRank - 2]);
-    instData[srcRank - 1] = subgroupSize;
+    instData[srcRank - 1] =
+        std::min(static_cast<int64_t>(subgroupSize), srcShape[srcRank - 1]);
     srcLayout = xegpu::LayoutAttr::get(context, toInt32Attr(instData));
 
   } else if (layoutKind == xegpu::LayoutKind::Lane) {
@@ -508,9 +545,52 @@ xegpu::SliceAttr xegpu::setupMultiReductionResultLayout(
                                        consumerLayout.getOrder());
   }
 
-  return xegpu::SliceAttr::get(context, srcLayout,
-                               DenseI64ArrayAttr::get(context, reductionDims));
+  LLVM_DEBUG(DBGS() << "  srcLayout: " << srcLayout << "\n");
+
+  auto result = xegpu::SliceAttr::get(
+      context, srcLayout, DenseI64ArrayAttr::get(context, reductionDims));
+  LLVM_DEBUG(DBGS() << "  result SliceAttr: " << result << "\n");
+  return result;
 }
+
+
+xegpu::SliceAttr xegpu::setupReductionResultLayout(
+    xegpu::LayoutKind layoutKind, VectorType srcVecTy,
+    const xegpu::uArch::uArch *uArch) {
+
+  auto srcShape = srcVecTy.getShape();
+  auto context = srcVecTy.getContext();
+  auto subgroupSize = uArch->getSubgroupSize();
+  xegpu::LayoutAttr srcLayout;
+
+  LLVM_DEBUG(DBGS() << "setupReductionResultLayout:\n");
+  LLVM_DEBUG(DBGS() << "  srcShape: [";
+             llvm::interleaveComma(srcShape, llvm::dbgs());
+             llvm::dbgs() << "]\n");
+
+  if (layoutKind == xegpu::LayoutKind::Subgroup) {
+        assert(true &&
+           "subgroup layout assignment not supported for insertStridedSlice.");
+  } else if (layoutKind == xegpu::LayoutKind::InstData) {
+        assert(true &&
+           "instData layout assignment not supported for insertStridedSlice.");
+  } else if (layoutKind == xegpu::LayoutKind::Lane) {
+
+    SmallVector<int32_t> laneLayout(1), laneData(1);
+    laneLayout[0] = std::min(subgroupSize, static_cast<int32_t>(srcShape[0]));
+    laneData[0] = 1;
+    srcLayout = xegpu::LayoutAttr::get(context, DenseI32ArrayAttr::get(context,laneLayout),
+                                       DenseI32ArrayAttr::get(context,laneData));
+  }
+
+  LLVM_DEBUG(DBGS() << "  srcLayout: " << srcLayout << "\n");
+
+  auto result = xegpu::SliceAttr::get(
+      context, srcLayout, DenseI64ArrayAttr::get(context, 0));
+  LLVM_DEBUG(DBGS() << "  result SliceAttr: " << result << "\n");
+  return result;
+}
+
 
 /// Sets up the result layout for a bitcast operation.
 /// When casting to a smaller bitwidth, adjusts the layout dimensions (sgData,
@@ -618,13 +698,14 @@ xegpu::DistributeLayoutAttr xegpu::setupInsertStridedSliceResultLayout(
     }
   } else if (layoutKind == xegpu::LayoutKind::Lane) {
     for (int dim = 0; dim < srcRank; dim++) {
-      assert(srcShape[dim] % consumerLaneLayout[dim] == 0 &&
-             "srcShape must be divisible by laneLayout for all dimensions");
-      laneDataValue = std::min(srcShape[dim] / consumerLaneLayout[dim],
-                               consumerLaneData[dim]);
-
-      requiredResLayout =
-          requiredResLayout.setDimData(dim, -1, -1, laneDataValue);
+      if (consumerLaneData[dim] != srcShape[dim]) {
+        assert(srcShape[dim] % consumerLaneLayout[dim] == 0 &&
+               "srcShape must be divisible by laneLayout for all dimensions");
+        laneDataValue = std::min(srcShape[dim] / consumerLaneLayout[dim],
+                                 consumerLaneData[dim]);
+        requiredResLayout =
+            requiredResLayout.setDimData(dim, -1, -1, laneDataValue);
+      }
     }
   }
   return requiredResLayout;
@@ -1045,7 +1126,7 @@ xegpu::DistributeLayoutAttr xegpu::getConsumerLayoutAt(OpOperand &operand) {
   Operation *op = operand.getOwner();
   unsigned idx = operand.getOperandNumber();
   xegpu::DistributeLayoutAttr resLayout;
-  if (op->getNumResults() == 1 && isa<VectorType>(op->getResult(0).getType()))
+  if (op->getNumResults() == 1)
     resLayout = xegpu::getDistributeLayoutAttr(op->getResult(0));
 
   // For vector::BroadcastOp, infer the source layout from the result layout.

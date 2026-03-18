@@ -444,6 +444,21 @@ class MultiRed2dOpPattern
     auto loc = reductionOp.getLoc();
     auto acc = reductionOp.getAcc();
 
+    //if the result is scalar after reduction, look for consumer convert_layout op and remove it.
+    Type resultType = reductionOp.getResult().getType();
+    DBGS() << "MultiRed2dOpPattern: resultType = " << resultType << "\n";
+    if(resultType.isIntOrFloat()){
+      DBGS() << "Result is scalar (intOrFloat), scanning uses for ConvertLayoutOp\n";
+      for (auto& use : reductionOp.getResult().getUses()) {
+        DBGS() << "  use owner: " << *use.getOwner() << "\n";
+        if (auto convertLayoutOp = llvm::dyn_cast<xegpu::ConvertLayoutOp>(use.getOwner())) {
+          DBGS() << "  Found ConvertLayoutOp, replacing with reductionOp result\n";
+          rewriter.replaceOp(convertLayoutOp, reductionOp.getResult());
+          break;
+        }
+      }
+    }
+
     // The first reduction's dist attribute does not have the cross lane dim.
     auto resSliceLayoutAttr = cast<xegpu::SliceAttr>(resLayout);
     SmallVector<int64_t> dropDims{crossLaneDim};

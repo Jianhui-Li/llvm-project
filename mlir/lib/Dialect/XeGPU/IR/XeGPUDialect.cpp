@@ -160,7 +160,7 @@ bool XeGPUDialect::isEvenlyDistributable(llvm::ArrayRef<int64_t> shape,
   // check LaneLayout and LaneData
   auto maybeLaneShape =
       tryDistribute(instShape, attr.getEffectiveLaneLayoutAsInt(),
-                    attr.getEffectiveLaneDataAsInt(), false);
+                    attr.getEffectiveLaneDataAsInt(), true);
   return maybeLaneShape.has_value();
 }
 
