@@ -170,28 +170,51 @@ XeGPUBlockingPass::getTileShape(Operation *op) const {
                             ? storeScatterOp->getOpOperand(0)
                             : storeScatterOp->getOpOperand(1));
 
-  if (isa<xegpu::DpasOp>(op)) {
+  if (isa<xegpu::DpasOp>(op) || isa<xegpu::DpasMxOp>(op)) {
     std::optional<SmallVector<int64_t>> aTile =
         getTileShape(op->getOpOperand(0));
     std::optional<SmallVector<int64_t>> bTile =
         getTileShape(op->getOpOperand(1));
 
+    LLVM_DEBUG(llvm::dbgs() << "getTileShape for Dpas/DpasMx: " << *op << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  aTile: "
+                            << (aTile ? llvm::join(llvm::map_range(*aTile,
+                                   [](int64_t v) { return std::to_string(v); }), "x")
+                                      : "nullopt")
+                            << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  bTile: "
+                            << (bTile ? llvm::join(llvm::map_range(*bTile,
+                                   [](int64_t v) { return std::to_string(v); }), "x")
+                                      : "nullopt")
+                            << "\n");
+
     if (!aTile || aTile->size() != 2 || !bTile || bTile->size() != 2)
       return std::nullopt;
 
     // semantic check for A and B
-    if ((*aTile)[1] != (*bTile)[0])
+    if ((*aTile)[1] != (*bTile)[0]) {
+      LLVM_DEBUG(llvm::dbgs() << "  A/B semantic check failed: aTile[1]="
+                              << (*aTile)[1] << " != bTile[0]=" << (*bTile)[0]
+                              << "\n");
       return std::nullopt;
+    }
 
     // semantic check for C
-    if (op->getNumOperands() == 3) {
+    if (op->getNumOperands() >= 3) {
       std::optional<SmallVector<int64_t>> cTile =
           getTileShape(op->getOpOperand(2));
       int64_t expectedCTile[2] = {(*aTile)[0], (*bTile)[1]};
+      LLVM_DEBUG(llvm::dbgs() << "  cTile: "
+                              << (cTile ? llvm::join(llvm::map_range(*cTile,
+                                     [](int64_t v) { return std::to_string(v); }), "x")
+                                        : "nullopt")
+                              << ", expected: " << expectedCTile[0] << "x"
+                              << expectedCTile[1] << "\n");
       if (!cTile || !llvm::equal(*cTile, expectedCTile))
         return std::nullopt;
     }
-
+    LLVM_DEBUG(llvm::dbgs() << "  result: [" << (*aTile)[0] << ", "
+                            << (*aTile)[1] << ", " << (*bTile)[1] << "]\n");
     return SmallVector<int64_t>({(*aTile)[0], (*aTile)[1], (*bTile)[1]});
   }
 

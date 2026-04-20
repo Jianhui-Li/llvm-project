@@ -22,7 +22,10 @@
 #include "mlir/Dialect/XeGPU/Transforms/XeGPULayoutImpl.h"
 #include "mlir/Dialect/XeGPU/Utils/XeGPUUtils.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/Support/Debug.h"
 #include <optional>
+
+#define DEBUG_TYPE "xegpu-wg-to-sg-distribute"
 
 namespace mlir {
 namespace xegpu {
@@ -451,6 +454,94 @@ struct WgToSgDpasOp : public OpConversionPattern<xegpu::DpasOp> {
       }
     }
     rewriter.replaceOpWithMultiple(op, {newDpasOps});
+    return success();
+  }
+};
+
+/// This pattern transforms the DpasMxOp to work at subgroup level.
+struct WgToSgDpasMxOp : public OpConversionPattern<xegpu::DpasMxOp> {
+  using OpConversionPattern<xegpu::DpasMxOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(xegpu::DpasMxOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+
+    Location loc = op.getLoc();
+    VectorType resultTy = op.getResult().getType();
+
+    LLVM_DEBUG(llvm::dbgs() << "WgToSgDpasMxOp: original op: " << op << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  resultTy: " << resultTy << "\n");
+
+    if (resultTy.getRank() != 2)
+      return failure();
+
+    auto layoutCd = op.getLayoutCdAttr();
+    auto layoutA = op.getLayoutAAttr();
+    auto layoutB = op.getLayoutBAttr();
+
+
+    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getA() size: "
+                            << adaptor.getA().size() << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getB() size: "
+                            << adaptor.getB().size() << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getAcc() size: "
+                            << adaptor.getAcc().size() << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getScaleA() size: "
+                            << adaptor.getScaleA().size() << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getScaleB() size: "
+                            << adaptor.getScaleB().size() << "\n");
+
+    if (!layoutCd || !layoutA || !layoutB)
+      return failure();
+
+
+    size_t index_c = 0;
+    SmallVector<Value> newDpasMxOps;
+    for (auto [index_a, aVec] : llvm::enumerate(adaptor.getA())) {
+      for (auto [index_b, bVec] : llvm::enumerate(adaptor.getB())) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "  index_a=" << index_a << " aVec: " << aVec.getType()
+                   << ", index_b=" << index_b
+                   << " bVec: " << bVec.getType() << "\n");
+
+        Value accVal;
+        if (op.getAcc()) {
+          accVal = adaptor.getAcc()[index_c++];
+          LLVM_DEBUG(llvm::dbgs() << "    acc[" << (index_c - 1)
+                                  << "]: " << accVal.getType() << "\n");
+        }
+        Value scaleAVal;
+        if (op.getScaleA()) {
+          scaleAVal = adaptor.getScaleA()[index_a];
+          LLVM_DEBUG(llvm::dbgs() << "    scaleA[" << index_a
+                                  << "]: " << scaleAVal.getType() << "\n");
+        }
+        Value scaleBVal;
+        if (op.getScaleB()) {
+          scaleBVal = adaptor.getScaleB()[index_b];
+          LLVM_DEBUG(llvm::dbgs() << "    scaleB[" << index_b
+                                  << "]: " << scaleBVal.getType() << "\n");
+        }
+
+        ArrayRef<int64_t> aVecShape =
+            llvm::cast<VectorType>(aVec.getType()).getShape();
+        ArrayRef<int64_t> bVecShape =
+            llvm::cast<VectorType>(bVec.getType()).getShape();
+        VectorType resTy = VectorType::get({aVecShape[0], bVecShape[1]},
+                                           resultTy.getElementType());
+        LLVM_DEBUG(llvm::dbgs() << "    resTy: " << resTy << "\n");
+        auto newDpasMxOp = xegpu::DpasMxOp::create(
+            rewriter, loc, resTy, aVec, bVec, accVal, scaleAVal, scaleBVal,
+            layoutA.dropSgLayoutAndData(), layoutB.dropSgLayoutAndData(),
+            layoutCd.dropSgLayoutAndData());
+        LLVM_DEBUG(llvm::dbgs() << "    created: " << newDpasMxOp << "\n");
+
+        newDpasMxOps.push_back(newDpasMxOp);
+      }
+    }
+    LLVM_DEBUG(llvm::dbgs() << "  total new DpasMxOps: "
+                            << newDpasMxOps.size() << "\n");
+    rewriter.replaceOpWithMultiple(op, {newDpasMxOps});
     return success();
   }
 };
@@ -1561,18 +1652,18 @@ using WgToSgVectorCreateMaskOp = WgToSgVectorMaskOp<vector::CreateMaskOp>;
 namespace mlir {
 namespace xegpu {
 void populateXeGPUWgToSgDistributePatterns(RewritePatternSet &patterns) {
-  patterns
-      .add<WgToSgCreateNdOp, WgToSgCreateNdOpNoOffset, WgToSgLoadNdOp,
-           WgToSgLoadNdOpWithOffset, WgToSgStoreNdOp, WgToSgStoreNdOpWithOffset,
-           WgToSgUpdateNdOffsetOp, WgToSgDpasOp, WgToSgPrefetchNdOp,
-           WgToSgPrefetchNdOpWithOffset, UnrealizedConversionCastOpPattern,
-           WgToSgElementwiseOp, WgToSgVectorBroadcastOp, WgToSgConvertLayoutOp,
-           WgToSgArithConstantOp, WgToSgLoadGatherOpWithOffset,
-           WgToSgStoreScatterOpWithOffset, WgToSgLoadMatrixOp,
-           WgToSgStoreMatrixOp, WgToSgVectorStepOp, WgToSgVectorShapeCastOp,
-           WgToSgMultiDimReductionOp, WgToSgVectorTransposeOp,
-           WgToSgVectorConstantMaskOp, WgToSgVectorCreateMaskOp>(
-          patterns.getContext());
+  patterns.add<WgToSgCreateNdOp, WgToSgCreateNdOpNoOffset, WgToSgLoadNdOp,
+               WgToSgLoadNdOpWithOffset, WgToSgStoreNdOp,
+               WgToSgStoreNdOpWithOffset, WgToSgUpdateNdOffsetOp, WgToSgDpasOp,
+               WgToSgDpasMxOp, WgToSgPrefetchNdOp, WgToSgPrefetchNdOpWithOffset,
+               UnrealizedConversionCastOpPattern, WgToSgElementwiseOp,
+               WgToSgVectorBroadcastOp, WgToSgConvertLayoutOp,
+               WgToSgArithConstantOp, WgToSgLoadGatherOpWithOffset,
+               WgToSgStoreScatterOpWithOffset, WgToSgLoadMatrixOp,
+               WgToSgStoreMatrixOp, WgToSgVectorStepOp, WgToSgVectorShapeCastOp,
+               WgToSgMultiDimReductionOp, WgToSgVectorTransposeOp,
+               WgToSgVectorConstantMaskOp, WgToSgVectorCreateMaskOp>(
+      patterns.getContext());
 }
 } // namespace xegpu
 } // namespace mlir
@@ -1692,6 +1783,11 @@ void XeGPUWgToSgDistributePass::runOnOperation() {
   });
 
   target.addDynamicallyLegalOp<xegpu::DpasOp>([=](xegpu::DpasOp op) -> bool {
+    auto layout = op.getLayoutCdAttr();
+    return isLegal(layout);
+  });
+
+  target.addDynamicallyLegalOp<xegpu::DpasMxOp>([=](xegpu::DpasMxOp op) -> bool {
     auto layout = op.getLayoutCdAttr();
     return isLegal(layout);
   });

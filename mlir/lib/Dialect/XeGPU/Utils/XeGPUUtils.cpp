@@ -195,6 +195,15 @@ xegpu::getDistributeLayoutAttr(const OpOperand &opr) {
         return dpasOp.getLayoutCdAttr();
       }
     }
+    if (auto dpasMxOp = dyn_cast<xegpu::DpasMxOp>(op)) {
+      if (idx == 0) {
+        return dpasMxOp.getLayoutAAttr();
+      } else if (idx == 1) {
+        return dpasMxOp.getLayoutBAttr();
+      } else if (idx == 2) {
+        return dpasMxOp.getLayoutCdAttr();
+      }
+    }
     if (auto convertOp = dyn_cast<xegpu::ConvertLayoutOp>(op)) {
       return convertOp.getInputLayoutAttr();
     }

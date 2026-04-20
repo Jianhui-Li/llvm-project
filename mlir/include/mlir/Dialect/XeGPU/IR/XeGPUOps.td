@@ -1759,7 +1759,6 @@ def XeGPU_TruncfOp
 }
 
 def XeGPU_DpasMxOp : XeGPU_Op<"dpas_mx", [Pure, AttrSizedOperandSegments,
-                                          AllElementTypesMatch<["a", "b"]>,
                                           AnchorLayoutInterface]> {
   let summary = "It performs scaled mma computation";
 
