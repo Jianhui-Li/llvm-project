@@ -371,8 +371,7 @@ void CIRGenFunction::emitVarDecl(const VarDecl &d) {
       return;
     }
 
-    cir::GlobalLinkageKind linkage =
-        cgm.getCIRLinkageVarDefinition(&d, /*IsConstant=*/false);
+    cir::GlobalLinkageKind linkage = cgm.getCIRLinkageVarDefinition(&d);
 
     // FIXME: We need to force the emission/use of a guard variable for
     // some variables even if we can constant-evaluate them because
@@ -1071,6 +1070,17 @@ void CIRGenFunction::pushIrregularPartialArrayCleanup(mlir::Value arrayBegin,
       destroyer);
 }
 
+/// pushEHDestroyIfNeeded - Push the standard destructor for the given type as
+/// an EH-only cleanup. If EH cleanup is not needed, just return.
+void CIRGenFunction::pushEHDestroyIfNeeded(QualType::DestructionKind dtorKind,
+                                           Address addr, QualType type) {
+  if (!needsEHCleanup(dtorKind))
+    return;
+
+  assert(!cir::MissingFeatures::useEHCleanupForArray());
+  pushDestroy(EHCleanup, addr, type, getDestroyer(dtorKind));
+}
+
 /// Push the standard destructor for the given type as
 /// at least a normal cleanup.
 void CIRGenFunction::pushDestroy(QualType::DestructionKind dtorKind,
@@ -1112,15 +1122,10 @@ void CIRGenFunction::pushLifetimeExtendedDestroy(CleanupKind cleanupKind,
     return;
   }
 
-  // Classic codegen also uses pushDestroyAndDeferDeactivation here to push an
-  // EH cleanup that protects the temporary during the rest of the full
-  // expression, then deactivates it when the full expression ends. Deferred
-  // deactivation is being implemented now, but it wasn't when this code was
-  // implemented. This will be updated in a separate change.
-  if (getLangOpts().Exceptions) {
-    cgm.errorNYI("lifetime-extended cleanup with exceptions enabled");
-    return;
-  }
+  // Add the cleanup to the EHStack. After the full-expr, this would be
+  // deactivated before being popped from the stack.
+  pushDestroyAndDeferDeactivation(cleanupKind, addr, type, destroyer,
+                                  useEHCleanupForArray);
 
   assert(!cir::MissingFeatures::useEHCleanupForArray());
 
@@ -1135,10 +1140,8 @@ void CIRGenFunction::pushPendingCleanupToEHStack(
   if (entry.activeFlag.isValid()) {
     EHCleanupScope &scope = cast<EHCleanupScope>(*ehStack.begin());
     scope.setActiveFlag(entry.activeFlag);
-    if (scope.isNormalCleanup())
-      scope.setTestFlagInNormalCleanup();
-    if (scope.isEHCleanup())
-      scope.setTestFlagInEHCleanup();
+    scope.setTestFlagInNormalCleanup(scope.isNormalCleanup());
+    scope.setTestFlagInEHCleanup(scope.isEHCleanup());
   }
 }
 

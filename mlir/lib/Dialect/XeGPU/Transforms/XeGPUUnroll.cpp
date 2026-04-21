@@ -513,10 +513,10 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
     LLVM_DEBUG(llvm::dbgs() << "  aBlockSize: [" << M << ", " << K << "]\n");
     LLVM_DEBUG(llvm::dbgs() << "  bBlockSize: [" << K << ", " << N << "]\n");
     LLVM_DEBUG(llvm::dbgs() << "  cBlockSize: [" << M << ", " << N << "]\n");
-    LLVM_DEBUG(llvm::dbgs() << "  aScaleBlockSize: [" << M << ", " << K / 32
-                            << "]\n");
-    LLVM_DEBUG(llvm::dbgs() << "  bScaleBlockSize: [" << K / 32 << ", " << N
-                            << "]\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  aScaleBlockSize: [" << M << ", " << K / 32 << "]\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  bScaleBlockSize: [" << K / 32 << ", " << N << "]\n");
 
     auto packWrapper = [&](TypedValue<VectorType> val,
                            ArrayRef<int64_t> blockSize) {
@@ -557,10 +557,10 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
     LLVM_DEBUG(llvm::dbgs() << "  aVals size: " << aVals.size() << "\n");
     LLVM_DEBUG(llvm::dbgs() << "  bVals size: " << bVals.size() << "\n");
     LLVM_DEBUG(llvm::dbgs() << "  cVals size: " << cVals.size() << "\n");
-    LLVM_DEBUG(llvm::dbgs() << "  aScaleVals size: " << aScaleVals.size()
-                            << "\n");
-    LLVM_DEBUG(llvm::dbgs() << "  bScaleVals size: " << bScaleVals.size()
-                            << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  aScaleVals size: " << aScaleVals.size() << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  bScaleVals size: " << bScaleVals.size() << "\n");
 
     // Skip the operation if every operand has an invalid blocking size (empty)
     // or if the original shape matches the blocking size (size == 1).
@@ -592,16 +592,14 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
           Value aVec = aVals[i * kIters + k];
           Value bVec = bVals[k * nIters + j];
 
-          LLVM_DEBUG(llvm::dbgs()
-                     << "  [i=" << i << ", j=" << j << ", k=" << k
-                     << "] aVec: " << aVec.getType()
-                     << ", bVec: " << bVec.getType() << "\n");
+          LLVM_DEBUG(llvm::dbgs() << "  [i=" << i << ", j=" << j << ", k=" << k
+                                  << "] aVec: " << aVec.getType()
+                                  << ", bVec: " << bVec.getType() << "\n");
 
           SmallVector<Value> operands({aVec, bVec});
           if (tmpC) {
             operands.push_back(tmpC);
-            LLVM_DEBUG(llvm::dbgs()
-                       << "    tmpC: " << tmpC.getType() << "\n");
+            LLVM_DEBUG(llvm::dbgs() << "    tmpC: " << tmpC.getType() << "\n");
           }
           if (ascale) {
             Value aScaleVec = aScaleVals[i * kIters + k];
@@ -626,79 +624,11 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
       }
     }
 
-    LLVM_DEBUG(llvm::dbgs() << "  total new DpasMxOps: " << newOps.size()
-                            << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  total new DpasMxOps: " << newOps.size() << "\n");
 
     Value castOp = unpack(newOps, resultTy, cBlockSize, loc, rewriter);
     rewriter.replaceOp(op, castOp);
-    return success();
-  }
-};
-
-struct UnrollCreateDescOp : public UnrollPattern<xegpu::CreateDescOp> {
-  using UnrollPattern<xegpu::CreateDescOp>::UnrollPattern;
-  LogicalResult matchAndRewrite(xegpu::CreateDescOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    xegpu::TensorDescType tdescTy = op.getType();
-    TypedValue<::mlir::VectorType> indiceVec = op.getOffsets();
-    VectorType indiceVecTy = indiceVec.getType();
-
-    if (!tdescTy.isScattered())
-      return failure();
-
-    std::optional<SmallVector<int64_t>> targetShape = getTargetShape(op);
-    if (!targetShape)
-      return failure();
-
-    SmallVector<int64_t> targetIndiceShape(*targetShape);
-    int64_t originalChunkSize = tdescTy.getChunkSizeAsInt();
-    // IndiceVec is 1 dim lower than tdescTy when chunkSize is larger than 1.
-    if (originalChunkSize > 1)
-      targetIndiceShape.pop_back();
-
-    auto newTdescTy = getUnrolledTypes(tdescTy, *targetShape)[0];
-    SmallVector<Type> convertedIndiceTypes =
-        getUnrolledTypes(indiceVecTy, targetIndiceShape);
-    SmallVector<Value> convertedIndiceVec =
-        pack(indiceVec, convertedIndiceTypes, targetIndiceShape, loc, rewriter);
-
-    SmallVector<Value> newOps;
-
-    // More indices is need when chunkSize > 1. Since a big load from one
-    // address could be break into multiple small loads.
-    if (originalChunkSize > 1) {
-      int64_t blockedChunkSize = targetShape->back();
-      int64_t numNewChunks = originalChunkSize / blockedChunkSize;
-
-      for (auto [indice, indiceType] :
-           llvm::zip(convertedIndiceVec, convertedIndiceTypes)) {
-        for (int64_t i = 0; i < numNewChunks; ++i) {
-          // Compute the offset
-          Value inc = arith::ConstantIndexOp::create(rewriter, loc,
-                                                     i * blockedChunkSize);
-          Value incVec =
-              vector::BroadcastOp::create(rewriter, loc, indiceType, inc);
-          Value offsetIndice =
-              arith::AddIOp::create(rewriter, loc, indice, incVec);
-
-          auto newOp = xegpu::CreateDescOp::create(
-              rewriter, loc, newTdescTy, op.getSource(), offsetIndice);
-
-          newOps.push_back(newOp);
-        }
-      }
-    } else {
-      for (auto indice : convertedIndiceVec) {
-        auto newOp = xegpu::CreateDescOp::create(rewriter, loc, newTdescTy,
-                                                 op.getSource(), indice);
-        newOps.push_back(newOp);
-      }
-    }
-
-    Value castOp = unpack(newOps, tdescTy, *targetShape, loc, rewriter);
-    rewriter.replaceOp(op, castOp);
-
     return success();
   }
 };
@@ -721,7 +651,7 @@ struct UnrollLoadGatherOp : public UnrollPattern<xegpu::LoadGatherOp> {
       return failure();
 
     SmallVector<int64_t> targetMaskShape(*targetShape);
-    int64_t originalChunkSize = tdescTy.getChunkSizeAsInt();
+    int originalChunkSize = op.getChunkSize().value_or(1);
 
     VectorType maskTy = llvm::dyn_cast<VectorType>(op.getMask().getType());
 
@@ -1012,7 +942,7 @@ struct UnrollStoreScatterOp : public UnrollPattern<xegpu::StoreScatterOp> {
       return failure();
 
     SmallVector<int64_t> targetMaskShape(*targetShape);
-    int64_t originalChunkSize = tdescTy.getChunkSizeAsInt();
+    int originalChunkSize = op.getChunkSize().value_or(1);
 
     VectorType maskTy = llvm::dyn_cast<VectorType>(op.getMask().getType());
 
@@ -1054,59 +984,6 @@ struct UnrollStoreScatterOp : public UnrollPattern<xegpu::StoreScatterOp> {
     }
 
     rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-struct UnrollUpdateOffsetOp : public UnrollPattern<xegpu::UpdateOffsetOp> {
-  using UnrollPattern<xegpu::UpdateOffsetOp>::UnrollPattern;
-  LogicalResult matchAndRewrite(xegpu::UpdateOffsetOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    xegpu::TensorDescType tdescTy = op.getTensorDescType();
-
-    if (!tdescTy.isScattered())
-      return failure();
-
-    std::optional<SmallVector<int64_t>> targetShape = getTargetShape(op);
-    if (!targetShape)
-      return failure();
-
-    SmallVector<Type> convertedTdescTypes =
-        getUnrolledTypes(tdescTy, *targetShape);
-    SmallVector<Value> convertedTdesc = pack(
-        op.getTensorDesc(), convertedTdescTypes, *targetShape, loc, rewriter);
-
-    TypedValue<::mlir::VectorType> offsetVec = op.getOffsets();
-    VectorType offsetVecTy = offsetVec.getType();
-    SmallVector<Type> convertedOffsetTypes;
-    SmallVector<Value> convertedOffsetVec;
-    SmallVector<Value> newOps;
-    int64_t originalChunkSize = tdescTy.getChunkSizeAsInt();
-    if (originalChunkSize > 1) {
-      auto targetOffsetShape = ArrayRef<int64_t>(*targetShape).drop_back();
-      convertedOffsetTypes = getUnrolledTypes(offsetVecTy, targetOffsetShape);
-
-      int64_t blockedChunkSize = targetShape->back();
-      int64_t numNewChunks = originalChunkSize / blockedChunkSize;
-      // the offset is reused across the chunk_size dimension
-      for (auto offset : pack(offsetVec, convertedOffsetTypes,
-                              targetOffsetShape, loc, rewriter))
-        convertedOffsetVec.append(numNewChunks, offset);
-
-    } else {
-      convertedOffsetTypes = getUnrolledTypes(offsetVecTy, *targetShape);
-      convertedOffsetVec =
-          pack(offsetVec, convertedOffsetTypes, *targetShape, loc, rewriter);
-    }
-
-    for (auto [t, o] : llvm::zip(convertedTdesc, convertedOffsetVec)) {
-      auto newOp =
-          xegpu::UpdateOffsetOp::create(rewriter, loc, t.getType(), t, o);
-      newOps.push_back(newOp);
-    }
-    Value castOp = unpack(newOps, op.getType(), *targetShape, loc, rewriter);
-    rewriter.replaceOp(op, castOp);
     return success();
   }
 };
@@ -1254,9 +1131,8 @@ void mlir::xegpu::populateXeGPUUnrollPatterns(
     RewritePatternSet &patterns, const xegpu::UnrollOptions &options) {
   patterns.add<UnrollCreateNdOp, UnrollUpdateNdOffsetOp, UnrollPrefetchNdOp,
                UnrollLoadNdOp, UnrollStoreNdOp, UnrollDpasOp, UnrollDpasMxOp,
-               UnrollCreateDescOp, UnrollLoadGatherOp, UnrollStoreScatterOp,
-               UnrollPrefetchOp, UnrollUpdateOffsetOp, UnrollLoadMatrixOp,
-               UnrollStoreMatrixOp, UnrollLoadGatherOpWithOffset,
-               UnrollStoreScatterOpWithOffsets, UnrollConvertLayoutOp>(
-      patterns.getContext(), options);
+               UnrollLoadGatherOp, UnrollStoreScatterOp, UnrollPrefetchOp,
+               UnrollLoadMatrixOp, UnrollStoreMatrixOp,
+               UnrollLoadGatherOpWithOffset, UnrollStoreScatterOpWithOffsets,
+               UnrollConvertLayoutOp>(patterns.getContext(), options);
 }

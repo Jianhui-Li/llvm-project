@@ -465,7 +465,6 @@ struct WgToSgDpasMxOp : public OpConversionPattern<xegpu::DpasMxOp> {
   matchAndRewrite(xegpu::DpasMxOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
 
-
     Location loc = op.getLoc();
     VectorType resultTy = op.getResult().getType();
 
@@ -478,12 +477,13 @@ struct WgToSgDpasMxOp : public OpConversionPattern<xegpu::DpasMxOp> {
     auto layoutCd = op.getLayoutCdAttr();
     auto layoutA = op.getLayoutAAttr();
     auto layoutB = op.getLayoutBAttr();
+    auto layoutAScale = op.getLayoutAScaleAttr();
+    auto layoutBScale = op.getLayoutBScaleAttr();
 
-
-    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getA() size: "
-                            << adaptor.getA().size() << "\n");
-    LLVM_DEBUG(llvm::dbgs() << "  adaptor.getB() size: "
-                            << adaptor.getB().size() << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  adaptor.getA() size: " << adaptor.getA().size() << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  adaptor.getB() size: " << adaptor.getB().size() << "\n");
     LLVM_DEBUG(llvm::dbgs() << "  adaptor.getAcc() size: "
                             << adaptor.getAcc().size() << "\n");
     LLVM_DEBUG(llvm::dbgs() << "  adaptor.getScaleA() size: "
@@ -491,18 +491,16 @@ struct WgToSgDpasMxOp : public OpConversionPattern<xegpu::DpasMxOp> {
     LLVM_DEBUG(llvm::dbgs() << "  adaptor.getScaleB() size: "
                             << adaptor.getScaleB().size() << "\n");
 
-    if (!layoutCd || !layoutA || !layoutB)
+    if (!layoutCd || !layoutA || !layoutB || !layoutAScale || !layoutBScale)
       return failure();
-
 
     size_t index_c = 0;
     SmallVector<Value> newDpasMxOps;
     for (auto [index_a, aVec] : llvm::enumerate(adaptor.getA())) {
       for (auto [index_b, bVec] : llvm::enumerate(adaptor.getB())) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "  index_a=" << index_a << " aVec: " << aVec.getType()
-                   << ", index_b=" << index_b
-                   << " bVec: " << bVec.getType() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "  index_a=" << index_a << " aVec: "
+                                << aVec.getType() << ", index_b=" << index_b
+                                << " bVec: " << bVec.getType() << "\n");
 
         Value accVal;
         if (op.getAcc()) {
@@ -533,14 +531,15 @@ struct WgToSgDpasMxOp : public OpConversionPattern<xegpu::DpasMxOp> {
         auto newDpasMxOp = xegpu::DpasMxOp::create(
             rewriter, loc, resTy, aVec, bVec, accVal, scaleAVal, scaleBVal,
             layoutA.dropSgLayoutAndData(), layoutB.dropSgLayoutAndData(),
-            layoutCd.dropSgLayoutAndData());
+            layoutCd.dropSgLayoutAndData(), layoutAScale.dropSgLayoutAndData(),
+            layoutBScale.dropSgLayoutAndData());
         LLVM_DEBUG(llvm::dbgs() << "    created: " << newDpasMxOp << "\n");
 
         newDpasMxOps.push_back(newDpasMxOp);
       }
     }
-    LLVM_DEBUG(llvm::dbgs() << "  total new DpasMxOps: "
-                            << newDpasMxOps.size() << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "  total new DpasMxOps: " << newDpasMxOps.size() << "\n");
     rewriter.replaceOpWithMultiple(op, {newDpasMxOps});
     return success();
   }
@@ -588,9 +587,6 @@ struct WgToSgVectorBroadcastOp
     std::tie(sgShape, count) = getSgShapeAndCount(wgShape, layout);
     VectorType newResultType =
         VectorType::get(sgShape, resultType.getElementType());
-
-    if (!layout.isDistributable(SmallVector<int64_t>(wgShape)))
-      return failure();
 
     SmallVector<Value> newBroadcastOps;
     auto distSource = adaptor.getOperands().front();
@@ -1042,9 +1038,6 @@ struct WgToSgLoadGatherOpWithOffset
   matchAndRewrite(xegpu::LoadGatherOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
 
-    if (!op.getOffsets())
-      return failure();
-
     Location loc = op.getLoc();
     VectorType resultType = dyn_cast<VectorType>(op.getResult().getType());
     if (!resultType)
@@ -1095,9 +1088,6 @@ struct WgToSgStoreScatterOpWithOffset
   LogicalResult
   matchAndRewrite(xegpu::StoreScatterOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-
-    if (!op.getOffsets())
-      return failure();
 
     Location loc = op.getLoc();
     VectorType valueType = dyn_cast<VectorType>(op.getValue().getType());
@@ -1787,10 +1777,11 @@ void XeGPUWgToSgDistributePass::runOnOperation() {
     return isLegal(layout);
   });
 
-  target.addDynamicallyLegalOp<xegpu::DpasMxOp>([=](xegpu::DpasMxOp op) -> bool {
-    auto layout = op.getLayoutCdAttr();
-    return isLegal(layout);
-  });
+  target.addDynamicallyLegalOp<xegpu::DpasMxOp>(
+      [=](xegpu::DpasMxOp op) -> bool {
+        auto layout = op.getLayoutCdAttr();
+        return isLegal(layout);
+      });
 
   target.addDynamicallyLegalOp<xegpu::LoadMatrixOp>(
       [=](xegpu::LoadMatrixOp op) -> bool {
@@ -1880,17 +1871,5 @@ void XeGPUWgToSgDistributePass::runOnOperation() {
           applyPartialConversion(getOperation(), target, std::move(patterns))))
     return signalPassFailure();
 
-  // Remove layout attributes from SCF ops
-  getOperation()->walk([](Operation *op) {
-    if (!isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(op))
-      return;
-
-    SmallVector<StringAttr> attrsToRemove;
-    for (auto namedAttr : op->getDiscardableAttrs()) {
-      if (isa<xegpu::DistributeLayoutAttr>(namedAttr.getValue()))
-        attrsToRemove.push_back(namedAttr.getName());
-    }
-    for (auto attrName : attrsToRemove)
-      op->removeDiscardableAttr(attrName);
-  });
+  xegpu::removeTemporaryLayoutAttrs(getOperation());
 }
