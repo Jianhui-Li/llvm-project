@@ -458,6 +458,98 @@ xegpu::inferBitCastSourceLayout(xegpu::DistributeLayoutAttr resLayout,
   return finalSrcLayout;
 }
 
+/// Infers the source layout attribute for an interleave operation given the
+/// result layout attribute. Interleave doubles the size of the innermost
+/// dimension, so the layout inference is similar to bitcast where the source
+/// element type is larger than the result element type (ratio = 2).
+xegpu::DistributeLayoutAttr
+xegpu::inferInterleaveSourceLayout(xegpu::DistributeLayoutAttr resLayout) {
+
+  SmallVector<int64_t> sgData = resLayout.getEffectiveSgDataAsInt();
+  SmallVector<int64_t> instData = resLayout.getEffectiveInstDataAsInt();
+  SmallVector<int64_t> laneData = resLayout.getEffectiveLaneDataAsInt();
+  size_t sgDataSize = sgData.size();
+  size_t instDataSize = instData.size();
+  size_t laneDataSize = laneData.size();
+  int64_t sgDataValue = -1;
+  int64_t instDataValue = -1;
+  int64_t laneDataValue = -1;
+  int64_t dim = resLayout.getRank() - 1;
+
+  // Interleave doubles the innermost dimension, so we need to halve the
+  // layout values (similar to bitcast with ratio = 2)
+  int ratio = 2;
+  if (sgDataSize) {
+    assert((sgData.back() % ratio) == 0 &&
+           "sgData not divisible by interleave ratio");
+    sgDataValue = sgData.back() / ratio;
+  }
+  if (instDataSize) {
+    llvm::dbgs() << "[DEBUG inferInterleaveSourceLayout] instData.back() = "
+                 << instData.back() << ", ratio = " << ratio
+                 << ", divisible = " << ((instData.back() % ratio) == 0)
+                 << "\n";
+    llvm::dbgs() << "[DEBUG inferInterleaveSourceLayout] Full instData = [";
+    for (size_t i = 0; i < instData.size(); ++i) {
+      if (i > 0)
+        llvm::dbgs() << ", ";
+      llvm::dbgs() << instData[i];
+    }
+    llvm::dbgs() << "]\n";
+    llvm::dbgs() << "[DEBUG inferInterleaveSourceLayout] resLayout = "
+                 << resLayout << "\n";
+    assert((instData.back() % ratio) == 0 &&
+           "instData not divisible by interleave ratio");
+    instDataValue = instData.back() / ratio;
+  }
+  if (laneDataSize) {
+    assert((laneData.back() % ratio) == 0 &&
+           "laneData not divisible by interleave ratio");
+    laneDataValue = laneData.back() / ratio;
+  }
+
+  xegpu::DistributeLayoutAttr finalSrcLayout;
+  finalSrcLayout =
+      resLayout.setDimData(dim, sgDataValue, instDataValue, laneDataValue);
+
+  return finalSrcLayout;
+}
+
+/// Infers the source layout attribute for a deinterleave operation given the
+/// result layout attribute. Deinterleave halves the size of the innermost
+/// dimension, so the layout inference is similar to bitcast where the source
+/// element type is smaller than the result element type (ratio = 2).
+xegpu::DistributeLayoutAttr
+xegpu::inferDeinterleaveSourceLayout(xegpu::DistributeLayoutAttr resLayout) {
+
+  SmallVector<int64_t> sgData = resLayout.getEffectiveSgDataAsInt();
+  SmallVector<int64_t> instData = resLayout.getEffectiveInstDataAsInt();
+  SmallVector<int64_t> laneData = resLayout.getEffectiveLaneDataAsInt();
+  size_t sgDataSize = sgData.size();
+  size_t instDataSize = instData.size();
+  size_t laneDataSize = laneData.size();
+  int64_t sgDataValue = -1;
+  int64_t instDataValue = -1;
+  int64_t laneDataValue = -1;
+  int64_t dim = resLayout.getRank() - 1;
+
+  // Deinterleave halves the innermost dimension, so we need to double the
+  // layout values (similar to bitcast with ratio = 2)
+  int ratio = 2;
+  if (sgDataSize)
+    sgDataValue = sgData.back() * ratio;
+  if (instDataSize)
+    instDataValue = instData.back() * ratio;
+  if (laneDataSize)
+    laneDataValue = laneData.back() * ratio;
+
+  xegpu::DistributeLayoutAttr finalSrcLayout;
+  finalSrcLayout =
+      resLayout.setDimData(dim, sgDataValue, instDataValue, laneDataValue);
+
+  return finalSrcLayout;
+}
+
 /// Infers the source layout attribute for an insert strided slice operation
 /// given the result layout attribute, result shape, and source shape. Removes
 /// leading dimensions from the result layout to match the source shape size.
@@ -877,6 +969,106 @@ xegpu::DistributeLayoutAttr xegpu::setupBitCastResultLayout(
   return consumerLayout;
 }
 
+/// Sets up the result layout for an interleave operation to ensure the source
+/// layout can be safely derived. Interleave doubles the innermost dimension,
+/// so the result layout must ensure that laneData is at least 2 (or a multiple
+/// of 2), and instData must be divisible by innermostDimLaneLayout * 2.
+///
+/// Example:
+///   Interleave: vector<128x256xf4> -> vector<128x512xf4>
+///   Consumer layout: laneLayout=[1, 16], laneData=[1, 4], instData=[1, 64]
+///   Result layout adjustment to ensure source can be safely inferred:
+///     - laneData must be >= 2 and multiple of 2 (so source = laneData/2 is
+///     valid)
+///     - instData must be divisible by (16 * 2 = 32) (so source = instData/2 is
+///     valid)
+///     - Adjusted instData: ensure (instData % 32 == 0)
+///
+xegpu::DistributeLayoutAttr xegpu::setupInterleaveResultLayout(
+    xegpu::LayoutKind layoutKind, VectorType srcVecTy, VectorType resVecTy,
+    DistributeLayoutAttr consumerLayout, const xegpu::uArch::uArch *uArch) {
+
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] ENTRY\n";
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] layoutKind = "
+               << static_cast<int>(layoutKind) << "\n";
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] srcVecTy = " << srcVecTy
+               << "\n";
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] resVecTy = " << resVecTy
+               << "\n";
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] consumerLayout = "
+               << consumerLayout << "\n";
+
+  ArrayRef<int64_t> srcShape = srcVecTy.getShape();
+  SmallVector<int64_t> sgData = consumerLayout.getEffectiveSgDataAsInt();
+  SmallVector<int64_t> instData = consumerLayout.getEffectiveInstDataAsInt();
+  SmallVector<int64_t> laneData = consumerLayout.getEffectiveLaneDataAsInt();
+
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] srcShape = [";
+  for (size_t i = 0; i < srcShape.size(); ++i) {
+    if (i > 0)
+      llvm::dbgs() << ", ";
+    llvm::dbgs() << srcShape[i];
+  }
+  llvm::dbgs() << "]\n";
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] instData = [";
+  for (size_t i = 0; i < instData.size(); ++i) {
+    if (i > 0)
+      llvm::dbgs() << ", ";
+    llvm::dbgs() << instData[i];
+  }
+  llvm::dbgs() << "]\n";
+
+  assert(consumerLayout.getRank() == static_cast<int64_t>(srcShape.size()) &&
+         "consumer layout rank must match source shape rank");
+  size_t dim = srcShape.size() - 1;
+  int64_t sgDataValue = -1;
+  int64_t instDataValue = -1;
+  int64_t laneDataValue = -1;
+  const int subgroupSize = uArch->getSubgroupSize();
+
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] dim = " << dim
+               << ", subgroupSize = " << subgroupSize << "\n";
+
+  // Interleave doubles the innermost dimension (ratio = 2)
+  int ratio = 2;
+  int innermostDimLaneLayout = subgroupSize;
+
+  if (layoutKind == xegpu::LayoutKind::Subgroup) {
+    sgDataValue = sgData[dim];
+    // Ensure sgDataValue is divisible by ratio so source sgData can be inferred
+    while ((sgDataValue <= srcShape[dim]) && (sgDataValue % ratio != 0))
+      sgDataValue *= 2;
+  } else if (layoutKind == xegpu::LayoutKind::InstData) {
+    instDataValue = instData[dim];
+    // Adjust instDataValue so it can be divided by (innermostDimLaneLayout *
+    // ratio) when inferring the source layout
+    while ((instDataValue <= srcShape[dim]) &&
+           (instDataValue % (innermostDimLaneLayout * ratio) != 0))
+      instDataValue *= 2;
+    assert((srcShape[dim] % instDataValue) == 0 &&
+           "srcShape, instData, and laneLayout for innermost must be 2^n!");
+  } else if (layoutKind == xegpu::LayoutKind::Lane) {
+    laneDataValue = laneData[dim];
+    // Ensure laneDataValue is at least 2 and divisible by ratio
+    // so that source laneData = laneDataValue/2 is valid
+    while ((laneDataValue <= srcShape[dim]) && (laneDataValue % ratio != 0))
+      laneDataValue *= 2;
+  }
+
+  llvm::dbgs()
+      << "[DEBUG setupInterleaveResultLayout] Before setDimData: sgDataValue = "
+      << sgDataValue << ", instDataValue = " << instDataValue
+      << ", laneDataValue = " << laneDataValue << "\n";
+
+  xegpu::DistributeLayoutAttr resLayout;
+  resLayout =
+      consumerLayout.setDimData(dim, sgDataValue, instDataValue, laneDataValue);
+
+  llvm::dbgs() << "[DEBUG setupInterleaveResultLayout] RETURN resLayout = "
+               << resLayout << "\n";
+  return resLayout;
+}
+
 /// Sets up the result layout for an insert strided slice operation.
 /// Creates a result layout based on the specified layout kind (InstData or
 /// Lane).
@@ -1179,6 +1371,122 @@ getValidLayouts(ArrayRef<int64_t> wgShape, ArrayRef<int64_t> instData,
   return candidates;
 }
 
+/// Helper function to compute inst_data vectors for DPAS operands A, B, and
+/// C/D.
+static std::optional<std::tuple<SmallVector<int64_t>, SmallVector<int64_t>,
+                                SmallVector<int64_t>>>
+getDpasInstDataVectors(VectorType aTy, VectorType bTy, VectorType cdTy,
+                       const xegpu::uArch::uArch *uArch) {
+  const int subgroupSize = uArch->getSubgroupSize();
+  const auto *uArchInstruction =
+      dyn_cast<xegpu::uArch::SubgroupMatrixMultiplyAcc>(uArch->getInstruction(
+          xegpu::uArch::InstructionKind::SubgroupMatrixMultiplyAcc));
+
+  const unsigned dataALen = aTy.getShape().front();
+  auto supportedALen = uArchInstruction->getSupportedM(aTy.getElementType());
+  const int maxALen =
+      xegpu::getLargestDivisor(dataALen, ArrayRef<unsigned>(supportedALen));
+
+  const unsigned dataBLen = bTy.getShape().back();
+  auto supportedBLen = uArchInstruction->getSupportedN(bTy.getElementType());
+  const int maxBLen =
+      xegpu::getLargestDivisor(dataBLen, ArrayRef<unsigned>(supportedBLen));
+
+  auto supportedCLen = uArchInstruction->getSupportedN(cdTy.getElementType());
+  const int maxCLen =
+      xegpu::getLargestDivisor(dataBLen, ArrayRef<unsigned>(supportedCLen));
+  if (maxALen == -1 || maxBLen == -1 || maxCLen == -1)
+    return std::nullopt;
+
+  SmallVector<int64_t> instDataA(aTy.getRank(), 1);
+  instDataA[aTy.getRank() - 2] = maxALen;
+  instDataA[aTy.getRank() - 1] = subgroupSize;
+  SmallVector<int64_t> instDataB(bTy.getRank(), 1);
+  instDataB[bTy.getRank() - 2] = subgroupSize;
+  instDataB[bTy.getRank() - 1] = maxBLen;
+  SmallVector<int64_t> instDataCD(cdTy.getRank(), 1);
+  instDataCD[cdTy.getRank() - 2] = maxALen;
+  instDataCD[cdTy.getRank() - 1] = maxCLen;
+  return std::make_tuple(instDataA, instDataB, instDataCD);
+}
+
+/// Helper function to set up subgroup layouts for DPAS operands A, B, and C/D.
+/// Returns the three layouts if successful, nullopt otherwise.
+static std::optional<std::tuple<xegpu::DistributeLayoutAttr,
+                                xegpu::DistributeLayoutAttr,
+                                xegpu::DistributeLayoutAttr>>
+getupDpasSubgroupLayouts(mlir::MLIRContext *context, VectorType aTy,
+                         VectorType bTy, VectorType cdTy,
+                         xegpu::DistributeLayoutAttr consumerLayout, int numSg,
+                         const xegpu::uArch::uArch *uArch) {
+  auto instDataVecs = getDpasInstDataVectors(aTy, bTy, cdTy, uArch);
+  if (!instDataVecs)
+    return std::nullopt;
+  auto [instDataA, instDataB, instDataCD] = *instDataVecs;
+  assert(instDataA.size() == 2 && instDataB.size() == 2 &&
+         instDataCD.size() == 2 &&
+         "Sg layout creation expects valid 2D inst data");
+
+  std::optional<LayoutRepresentation> consumerSgLayout = std::nullopt;
+  if (consumerLayout && consumerLayout.isForWorkgroup()) {
+    SmallVector<int64_t> sgLayoutD =
+        consumerLayout.getEffectiveSgLayoutAsInt();
+    consumerSgLayout = std::make_pair(sgLayoutD[0], sgLayoutD[1]);
+  }
+
+  // Get all valid layouts for A, B and C/D operands
+  auto layoutsA = getValidLayouts(aTy.getShape(), instDataA, numSg);
+  auto layoutsB = getValidLayouts(bTy.getShape(), instDataB, numSg);
+  auto layoutsCD = getValidLayouts(cdTy.getShape(), instDataCD, numSg);
+  if (layoutsA.empty() || layoutsB.empty() || layoutsCD.empty())
+    return std::nullopt;
+
+  // Pick the best subgroup layout
+  llvm::DenseSet<LayoutRepresentation> setA(layoutsA.begin(), layoutsA.end());
+  llvm::DenseSet<LayoutRepresentation> setCD(layoutsCD.begin(),
+                                              layoutsCD.end());
+  std::optional<LayoutRepresentation> bestPick;
+  for (auto &sgLayout : layoutsB) {
+    if (setA.contains(sgLayout) && setCD.contains(sgLayout)) {
+      if (consumerSgLayout.has_value() && sgLayout == *consumerSgLayout) {
+        bestPick = sgLayout;
+        break;
+      }
+      if (!bestPick)
+        bestPick = sgLayout;
+    }
+  }
+  if (!bestPick)
+    return std::nullopt;
+
+  SmallVector<int> sgLayout = {static_cast<int>(bestPick->first),
+                               static_cast<int>(bestPick->second)};
+  SmallVector<int> sgDataA = {
+      static_cast<int>(aTy.getShape()[0] / sgLayout[0]),
+      static_cast<int>(aTy.getShape()[1] / sgLayout[1])};
+  SmallVector<int> sgDataB = {
+      static_cast<int>(bTy.getShape()[0] / sgLayout[0]),
+      static_cast<int>(bTy.getShape()[1] / sgLayout[1])};
+  SmallVector<int> sgDataCD = {
+      static_cast<int>(cdTy.getShape()[0] / sgLayout[0]),
+      static_cast<int>(cdTy.getShape()[1] / sgLayout[1])};
+
+  auto dpasALayout = xegpu::LayoutAttr::get(
+      context, DenseI32ArrayAttr::get(context, sgLayout),
+      DenseI32ArrayAttr::get(context, sgDataA), nullptr, nullptr, nullptr,
+      nullptr);
+  auto dpasBLayout = xegpu::LayoutAttr::get(
+      context, DenseI32ArrayAttr::get(context, sgLayout),
+      DenseI32ArrayAttr::get(context, sgDataB), nullptr, nullptr, nullptr,
+      nullptr);
+  auto dpasCDLayout = xegpu::LayoutAttr::get(
+      context, DenseI32ArrayAttr::get(context, sgLayout),
+      DenseI32ArrayAttr::get(context, sgDataCD), nullptr, nullptr, nullptr,
+      nullptr);
+
+  return std::make_tuple(dpasALayout, dpasBLayout, dpasCDLayout);
+}
+
 /// Sets up the anchor layouts for dpas operands (A, B, and C/D).
 /// The numSg and consumerLayout (optional) are only used by sg layout
 /// creation.
@@ -1194,122 +1502,13 @@ xegpu::setupDpasLayout(xegpu::LayoutKind layoutKind, VectorType aTy,
       dyn_cast<xegpu::uArch::SubgroupMatrixMultiplyAcc>(uArch->getInstruction(
           xegpu::uArch::InstructionKind::SubgroupMatrixMultiplyAcc));
 
-  auto getInstDataVectors = [&]()
-      -> std::optional<std::tuple<SmallVector<int64_t>, SmallVector<int64_t>,
-                                  SmallVector<int64_t>>> {
-    const int subgroupSize = uArch->getSubgroupSize();
-    const unsigned dataALen = aTy.getShape().front();
-    auto supportedALen = uArchInstruction->getSupportedM(aTy.getElementType());
-    const int maxALen =
-        xegpu::getLargestDivisor(dataALen, ArrayRef<unsigned>(supportedALen));
-
-    const unsigned dataBLen = bTy.getShape().back();
-    auto supportedBLen = uArchInstruction->getSupportedN(bTy.getElementType());
-    const int maxBLen =
-        xegpu::getLargestDivisor(dataBLen, ArrayRef<unsigned>(supportedBLen));
-
-    auto supportedCLen = uArchInstruction->getSupportedN(cdTy.getElementType());
-    const int maxCLen =
-        xegpu::getLargestDivisor(dataBLen, ArrayRef<unsigned>(supportedCLen));
-    if (maxALen == -1 || maxBLen == -1 || maxCLen == -1)
-      return std::nullopt;
-
-    SmallVector<int64_t> instDataA(aTy.getRank(), 1);
-    instDataA[aTy.getRank() - 2] = maxALen;
-    instDataA[aTy.getRank() - 1] = subgroupSize;
-    SmallVector<int64_t> instDataB(bTy.getRank(), 1);
-    instDataB[bTy.getRank() - 2] = subgroupSize;
-    instDataB[bTy.getRank() - 1] = maxBLen;
-    SmallVector<int64_t> instDataCD(cdTy.getRank(), 1);
-    instDataCD[cdTy.getRank() - 2] = maxALen;
-    instDataCD[cdTy.getRank() - 1] = maxCLen;
-    return std::make_tuple(instDataA, instDataB, instDataCD);
-  };
-
   if (layoutKind == xegpu::LayoutKind::Subgroup) {
     assert(numSg > 0 &&
            "Number of subgroups must be provided for sg layout creation.");
-    auto instDataVecs = getInstDataVectors();
-    if (!instDataVecs)
-      return std::nullopt;
-    auto [instDataA, instDataB, instDataCD] = *instDataVecs;
-    assert(instDataA.size() == 2 && instDataB.size() == 2 &&
-           instDataCD.size() == 2 &&
-           "Sg layout creation expects valid 2D inst data");
-
-    std::optional<LayoutRepresentation> consumerSgLayout = std::nullopt;
-    if (consumerLayout && consumerLayout.isForWorkgroup()) {
-      SmallVector<int64_t> sgLayoutD =
-          consumerLayout.getEffectiveSgLayoutAsInt();
-      consumerSgLayout = std::make_pair(sgLayoutD[0], sgLayoutD[1]);
-    }
-
-    // Step 1. Get all valid layouts for A, B and C/D operands.
-    // Order them from most balanced to least balanced.
-    auto layoutsA = getValidLayouts(aTy.getShape(), instDataA, numSg);
-    auto layoutsB = getValidLayouts(bTy.getShape(), instDataB, numSg);
-    auto layoutsCD = getValidLayouts(cdTy.getShape(), instDataCD, numSg);
-    if (layoutsA.empty() || layoutsB.empty() || layoutsCD.empty())
-      return std::nullopt;
-
-    // Step 2. If the consumer layout can be reused for all operands, that
-    // layout is chosen. Otherwise, pick the most balanced subgroup layout
-    // that is valid for A, B and C (if present) operands
-    llvm::DenseSet<LayoutRepresentation> setA(layoutsA.begin(), layoutsA.end());
-    llvm::DenseSet<LayoutRepresentation> setCD(layoutsCD.begin(),
-                                               layoutsCD.end());
-    std::optional<LayoutRepresentation> bestPick;
-    for (auto &sgLayout : layoutsB) {
-      if (setA.contains(sgLayout) && setCD.contains(sgLayout)) {
-        // Is in (A and B and CD) and matches consumer -> best pick
-        if (consumerSgLayout.has_value() && sgLayout == *consumerSgLayout) {
-          bestPick = sgLayout;
-          break;
-        }
-        // Is in (A and B and CD) layoutsB is ordered from most
-        // balanced to least. So the first one we see is the most balanced
-        // one, remember it and later only update if there is one that matches
-        // the consumer.
-        if (!bestPick)
-          bestPick = sgLayout;
-      }
-    }
-    // Step 3. If there is no subgroup layout compatible with A, B and C (if
-    // present) operands, we fail.
-    if (!bestPick)
-      return std::nullopt;
-    SmallVector<int> sgLayout = {static_cast<int>(bestPick->first),
-                                 static_cast<int>(bestPick->second)};
-    SmallVector<int> sgDataA = {
-        static_cast<int>(aTy.getShape()[0] / sgLayout[0]),
-        static_cast<int>(aTy.getShape()[1] / sgLayout[1])};
-    SmallVector<int> sgDataB = {
-        static_cast<int>(bTy.getShape()[0] / sgLayout[0]),
-        static_cast<int>(bTy.getShape()[1] / sgLayout[1])};
-    SmallVector<int> sgDataCD = {
-        static_cast<int>(cdTy.getShape()[0] / sgLayout[0]),
-        static_cast<int>(cdTy.getShape()[1] / sgLayout[1])};
-
-    auto dpasALayout = xegpu::LayoutAttr::get(
-        context, DenseI32ArrayAttr::get(context, sgLayout),
-        DenseI32ArrayAttr::get(context, sgDataA),
-        /*inst_data =*/nullptr, /*lane_layout =*/nullptr,
-        /*lane_data =*/nullptr, /*order =*/nullptr);
-
-    auto dpasBLayout = xegpu::LayoutAttr::get(
-        context, DenseI32ArrayAttr::get(context, sgLayout),
-        DenseI32ArrayAttr::get(context, sgDataB),
-        /*inst_data =*/nullptr, /*lane_layout =*/nullptr,
-        /*lane_data =*/nullptr, /*order =*/nullptr);
-
-    auto dpasCDLayout = xegpu::LayoutAttr::get(
-        context, DenseI32ArrayAttr::get(context, sgLayout),
-        DenseI32ArrayAttr::get(context, sgDataCD),
-        /*inst_data =*/nullptr, /*lane_layout =*/nullptr,
-        /*lane_data =*/nullptr, /*order =*/nullptr);
-    return std::make_tuple(dpasALayout, dpasBLayout, dpasCDLayout);
+    return getupDpasSubgroupLayouts(context, aTy, bTy, cdTy, consumerLayout,
+                                    numSg, uArch);
   } else if (layoutKind == xegpu::LayoutKind::InstData) {
-    auto instDataVecs = getInstDataVectors();
+    auto instDataVecs = getDpasInstDataVectors(aTy, bTy, cdTy, uArch);
     if (!instDataVecs)
       return std::nullopt;
     auto [instDataA, instDataB, instDataCD] = *instDataVecs;
@@ -1328,6 +1527,158 @@ xegpu::setupDpasLayout(xegpu::LayoutKind layoutKind, VectorType aTy,
     auto cdLayout = getDefaultLaneLayout2DBlockIo(
         cdTy, uArch /*, packingSize = std::nullopt */);
     return std::make_tuple(aLayout, bLayout, cdLayout);
+  }
+  return std::nullopt;
+}
+
+/// Sets up the anchor layouts for dpas_mx operands (A, B, C/D, A_scale, and
+/// B_scale). The numSg and consumerLayout (optional) are only used by sg layout
+/// creation.
+std::optional<
+    std::tuple<xegpu::DistributeLayoutAttr, xegpu::DistributeLayoutAttr,
+               xegpu::DistributeLayoutAttr, xegpu::DistributeLayoutAttr,
+               xegpu::DistributeLayoutAttr>>
+xegpu::setupDpasMxLayout(xegpu::LayoutKind layoutKind, VectorType aTy,
+                         VectorType bTy, VectorType cdTy,
+                         std::optional<VectorType> aScaleTy,
+                         std::optional<VectorType> bScaleTy,
+                         xegpu::DistributeLayoutAttr consumerLayout, int numSg,
+                         const xegpu::uArch::uArch *uArch) {
+  auto context = aTy.getContext();
+  const int subgroupSize = uArch->getSubgroupSize();
+
+  // Helper to create scale layout from parent layout
+  auto createScaleLayout = [&](VectorType parentTy, VectorType scaleTy,
+                               xegpu::DistributeLayoutAttr parentLayout,
+                               bool isBScale) -> xegpu::DistributeLayoutAttr {
+    if (!scaleTy || !parentLayout)
+      return nullptr;
+
+    // Calculate scaling factor by dividing parent shape by scale shape
+    ArrayRef<int64_t> parentShape = parentTy.getShape();
+    ArrayRef<int64_t> scaleShape = scaleTy.getShape();
+    int64_t scaleFactor = parentShape.back() / scaleShape.back();
+    int64_t rank = parentLayout.getRank();
+    assert(rank == 2 && "dpas layouts must be two dimensions");
+
+    SmallVector<int64_t> sgLayout = parentLayout.getEffectiveSgLayoutAsInt();
+    SmallVector<int64_t> sgData = parentLayout.getEffectiveSgDataAsInt();
+    SmallVector<int64_t> instData = parentLayout.getEffectiveInstDataAsInt();
+    SmallVector<int64_t> laneLayout =
+        parentLayout.getEffectiveLaneLayoutAsInt();
+    SmallVector<int64_t> laneData = parentLayout.getEffectiveLaneDataAsInt();
+    auto order = parentLayout.getOrder();
+
+    // Divide last dimension by scaling factor
+    if (!sgData.empty())
+      sgData.back() = sgData.back() / scaleFactor;
+    if (!instData.empty())
+      instData.back() = instData.back() / scaleFactor;
+
+    if (isBScale) {
+      // For B scale: lane_layout = [min(subgroupSize, scaleFactor), 1]
+      // lane_data = [1, number of scale elements]
+      laneLayout[rank - 2] =
+          std::min(static_cast<int64_t>(subgroupSize), scaleShape[rank-2]);
+      laneLayout[rank - 1] = 1;
+      laneData[rank - 2] = 1;
+      laneData[rank - 1] = scaleShape.back();
+    } else {
+      laneData.back() = scaleShape.back();
+    }
+
+    return xegpu::LayoutAttr::get(
+        context,
+        sgLayout.empty()
+            ? nullptr
+            : DenseI32ArrayAttr::get(
+                  context, SmallVector<int>(sgLayout.begin(), sgLayout.end())),
+        sgData.empty()
+            ? nullptr
+            : DenseI32ArrayAttr::get(
+                  context, SmallVector<int>(sgData.begin(), sgData.end())),
+        instData.empty()
+            ? nullptr
+            : DenseI32ArrayAttr::get(
+                  context, SmallVector<int>(instData.begin(), instData.end())),
+        laneLayout.empty() ? nullptr
+                           : DenseI32ArrayAttr::get(
+                                 context, SmallVector<int>(laneLayout.begin(),
+                                                           laneLayout.end())),
+        laneData.empty()
+            ? nullptr
+            : DenseI32ArrayAttr::get(
+                  context, SmallVector<int>(laneData.begin(), laneData.end())),
+        order);
+  };
+
+  if (layoutKind == xegpu::LayoutKind::Subgroup) {
+    assert(numSg > 0 &&
+           "Number of subgroups must be provided for sg layout creation.");
+    auto dpasLayouts =
+        getupDpasSubgroupLayouts(context, aTy, bTy, cdTy, consumerLayout, numSg, uArch);
+    if (!dpasLayouts)
+      return std::nullopt;
+
+    auto [dpasALayout, dpasBLayout, dpasCDLayout] = *dpasLayouts;
+
+    // Create scale layouts
+    auto aScaleLayout =
+        aScaleTy.has_value()
+            ? createScaleLayout(aTy, *aScaleTy, dpasALayout, false)
+            : nullptr;
+    auto bScaleLayout =
+        bScaleTy.has_value()
+            ? createScaleLayout(bTy, *bScaleTy, dpasBLayout, true)
+            : nullptr;
+
+    return std::make_tuple(dpasALayout, dpasBLayout, dpasCDLayout, aScaleLayout,
+                           bScaleLayout);
+  } else if (layoutKind == xegpu::LayoutKind::InstData) {
+    auto instDataVecs = getDpasInstDataVectors(aTy, bTy, cdTy, uArch);
+    if (!instDataVecs)
+      return std::nullopt;
+    auto [instDataA, instDataB, instDataCD] = *instDataVecs;
+
+    auto dpasALayout = xegpu::LayoutAttr::get(
+        context, SmallVector<int>(instDataA.begin(), instDataA.end()));
+    auto dpasBLayout = xegpu::LayoutAttr::get(
+        context, SmallVector<int>(instDataB.begin(), instDataB.end()));
+    auto dpasCDLayout = xegpu::LayoutAttr::get(
+        context, SmallVector<int>(instDataCD.begin(), instDataCD.end()));
+
+    // Create scale layouts
+    auto aScaleLayout =
+        aScaleTy.has_value()
+            ? createScaleLayout(aTy, *aScaleTy, dpasALayout, false)
+            : nullptr;
+    auto bScaleLayout =
+        bScaleTy.has_value()
+            ? createScaleLayout(bTy, *bScaleTy, dpasBLayout, true)
+            : nullptr;
+
+    return std::make_tuple(dpasALayout, dpasBLayout, dpasCDLayout, aScaleLayout,
+                           bScaleLayout);
+  } else if (layoutKind == xegpu::LayoutKind::Lane) {
+    const auto *uArchInstruction =
+        dyn_cast<xegpu::uArch::SubgroupMatrixMultiplyAcc>(uArch->getInstruction(
+            xegpu::uArch::InstructionKind::SubgroupMatrixMultiplyAcc));
+    auto aLayout = getDefaultLaneLayout2DBlockIo(
+        aTy, uArch, uArchInstruction->getPackedFormatBitSizeA());
+    auto bLayout = getDefaultLaneLayout2DBlockIo(
+        bTy, uArch, uArchInstruction->getPackedFormatBitSizeB(), true);
+    auto cdLayout = getDefaultLaneLayout2DBlockIo(cdTy, uArch);
+
+    // Create scale layouts
+    auto aScaleLayout = aScaleTy.has_value()
+                            ? createScaleLayout(aTy, *aScaleTy, aLayout, false)
+                            : nullptr;
+    auto bScaleLayout = bScaleTy.has_value()
+                            ? createScaleLayout(bTy, *bScaleTy, bLayout, true)
+                            : nullptr;
+
+    return std::make_tuple(aLayout, bLayout, cdLayout, aScaleLayout,
+                           bScaleLayout);
   }
   return std::nullopt;
 }

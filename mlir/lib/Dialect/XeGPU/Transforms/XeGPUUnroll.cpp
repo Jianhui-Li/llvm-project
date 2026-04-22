@@ -500,15 +500,16 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
     auto M = (*targetShape)[0];
     auto K = (*targetShape)[1];
     auto N = (*targetShape)[2];
+    auto S = (*targetShape)[3];
 
     LLVM_DEBUG(llvm::dbgs() << "  targetShape: M=" << M << ", K=" << K
-                            << ", N=" << N << "\n");
+                            << ", N=" << N << ", S=" << S << "\n");
 
     int64_t aBlockSize[2] = {M, K};
     int64_t bBlockSize[2] = {K, N};
     int64_t cBlockSize[2] = {M, N};
-    int64_t aScaleBlockSize[2] = {M, K / 32};
-    int64_t bScaleBlockSize[2] = {K / 32, N};
+    int64_t aScaleBlockSize[2] = {M, S};
+    int64_t bScaleBlockSize[2] = {S, N};
 
     LLVM_DEBUG(llvm::dbgs() << "  aBlockSize: [" << M << ", " << K << "]\n");
     LLVM_DEBUG(llvm::dbgs() << "  bBlockSize: [" << K << ", " << N << "]\n");

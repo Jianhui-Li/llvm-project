@@ -184,12 +184,29 @@ xegpu::getDistributeLayoutAttr(const OpOperand &opr) {
       }
     }
     if (auto dpasMxOp = dyn_cast<xegpu::DpasMxOp>(op)) {
-      if (idx == 0) {
+      // DpasMxOp has operands: a, b, optional acc, optional scale_a, optional scale_b
+      // Use AttrSizedOperandSegments to determine which operand this is
+      auto segmentSizesAttr = dpasMxOp->getAttrOfType<DenseI32ArrayAttr>(
+          dpasMxOp.getOperandSegmentSizesAttrName());
+      if (!segmentSizesAttr)
+        return nullptr;
+
+      auto segmentSizes = segmentSizesAttr.asArrayRef();
+      unsigned aSize = segmentSizes[0];
+      unsigned bSize = segmentSizes[1];
+      unsigned accSize = segmentSizes[2];
+      unsigned scaleASize = segmentSizes[3];
+
+      if (idx < aSize) {
         return dpasMxOp.getLayoutAAttr();
-      } else if (idx == 1) {
+      } else if (idx < aSize + bSize) {
         return dpasMxOp.getLayoutBAttr();
-      } else if (idx == 2) {
+      } else if (idx < aSize + bSize + accSize) {
         return dpasMxOp.getLayoutCdAttr();
+      } else if (idx < aSize + bSize + accSize + scaleASize) {
+        return dpasMxOp.getLayoutAScaleAttr();
+      } else {
+        return dpasMxOp.getLayoutBScaleAttr();
       }
     }
     if (auto convertOp = dyn_cast<xegpu::ConvertLayoutOp>(op)) {
