@@ -1719,10 +1719,6 @@ struct WgToSgVectorDeinterleaveOp
     if (!layout || !layout.isForWorkgroup())
       return failure();
 
-    SmallVector<int64_t> sgShape = getSgShapeAndCount(wgShape, layout).first;
-    VectorType newResultType =
-        VectorType::get(sgShape, resultType.getElementType());
-
     SmallVector<Value> newRes1Ops;
     SmallVector<Value> newRes2Ops;
     // Deinterleave produces two results from each source

@@ -1404,7 +1404,6 @@ struct UnrollBitCastPattern : public OpRewritePattern<vector::BitCastOp> {
 
     VectorType sourceType = bitCastOp.getSourceVectorType();
     VectorType resultType = bitCastOp.getResultVectorType();
-    ArrayRef<int64_t> sourceShape = sourceType.getShape();
     ArrayRef<int64_t> resultShape = resultType.getShape();
     Location loc = bitCastOp.getLoc();
 
@@ -1478,7 +1477,6 @@ struct UnrollInterleavePattern : public OpRewritePattern<vector::InterleaveOp> {
       return failure();
 
     VectorType resultType = interleaveOp.getResultVectorType();
-    VectorType sourceType = interleaveOp.getSourceVectorType();
     ArrayRef<int64_t> resultShape = resultType.getShape();
     Location loc = interleaveOp.getLoc();
 
@@ -1502,8 +1500,6 @@ struct UnrollInterleavePattern : public OpRewritePattern<vector::InterleaveOp> {
 
     VectorType targetType =
         VectorType::get(*targetShape, resultType.getElementType());
-    VectorType sourceTileType =
-        VectorType::get(sourceTileShape, sourceType.getElementType());
 
     // Unroll the interleave
     for (SmallVector<int64_t> resultOffsets :
@@ -1548,7 +1544,6 @@ struct UnrollDeinterleavePattern
       return failure();
 
     VectorType resultType = deinterleaveOp.getResultVectorType();
-    VectorType sourceType = deinterleaveOp.getSourceVectorType();
     ArrayRef<int64_t> resultShape = resultType.getShape();
     Location loc = deinterleaveOp.getLoc();
 
@@ -1571,9 +1566,6 @@ struct UnrollDeinterleavePattern
                                               rewriter.getZeroAttr(resultType));
     SmallVector<int64_t> resultStrides(targetShape->size(), 1);
     SmallVector<int64_t> sourceStrides(sourceTileShape.size(), 1);
-
-    VectorType targetType =
-        VectorType::get(*targetShape, resultType.getElementType());
 
     // Unroll the deinterleave
     for (SmallVector<int64_t> resultOffsets :
