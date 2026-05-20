@@ -994,7 +994,11 @@ void LayoutInfoPropagation::visitStoreNdOp(
       if (instHeight == -1)
         store.emitWarning(
             "No suitable instruction multiple found for the given shape.");
-      instData = {instHeight, instWidth};
+      // For rank > 2, prepend unit dims for batch dimensions.
+      for (int64_t d = 0; d < dataTy.getRank() - 2; ++d)
+        instData.push_back(1);
+      instData.push_back(instHeight);
+      instData.push_back(instWidth);
     }
 
     if (layoutKind == xegpu::LayoutKind::InstData)

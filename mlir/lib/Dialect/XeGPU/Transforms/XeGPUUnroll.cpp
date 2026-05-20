@@ -432,18 +432,32 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
     Location loc = op.getLoc();
 
     std::optional<SmallVector<int64_t>> targetShape = getTargetShape(op);
-    if (!targetShape || targetShape->size() != 4)
+    if (!targetShape || targetShape->size() < 4)
       return failure();
-    auto M = (*targetShape)[0];
-    auto K = (*targetShape)[1];
-    auto N = (*targetShape)[2];
-    auto S = (*targetShape)[3];
 
-    int64_t aBlockSize[2] = {M, K};
-    int64_t bBlockSize[2] = {K, N};
-    int64_t cBlockSize[2] = {M, N};
-    int64_t aScaleBlockSize[2] = {M, S};
-    int64_t bScaleBlockSize[2] = {S, N};
+    // targetShape is [batch..., M, K, N, S]
+    int64_t tsRank = targetShape->size();
+    auto M = (*targetShape)[tsRank - 4];
+    auto K = (*targetShape)[tsRank - 3];
+    auto N = (*targetShape)[tsRank - 2];
+    auto S = (*targetShape)[tsRank - 1];
+    ArrayRef<int64_t> batchDims(targetShape->data(), tsRank - 4);
+
+    SmallVector<int64_t> aBlockSize(batchDims);
+    aBlockSize.push_back(M);
+    aBlockSize.push_back(K);
+    SmallVector<int64_t> bBlockSize(batchDims);
+    bBlockSize.push_back(K);
+    bBlockSize.push_back(N);
+    SmallVector<int64_t> cBlockSize(batchDims);
+    cBlockSize.push_back(M);
+    cBlockSize.push_back(N);
+    SmallVector<int64_t> aScaleBlockSize(batchDims);
+    aScaleBlockSize.push_back(M);
+    aScaleBlockSize.push_back(S);
+    SmallVector<int64_t> bScaleBlockSize(batchDims);
+    bScaleBlockSize.push_back(S);
+    bScaleBlockSize.push_back(N);
 
     auto a = op.getA();
     auto b = op.getB();
@@ -468,35 +482,46 @@ struct UnrollDpasMxOp : public UnrollPattern<xegpu::DpasMxOp> {
 
     auto aShape = a.getType().getShape();
     auto bShape = b.getType().getShape();
-    int64_t mIters = aShape[0] / M;
-    int64_t kIters = aShape[1] / K;
-    int64_t nIters = bShape[1] / N;
+    int64_t batchRank = batchDims.size();
+    int64_t mIters = aShape[batchRank] / M;
+    int64_t kIters = aShape[batchRank + 1] / K;
+    int64_t nIters = bShape[batchRank + 1] / N;
+
+    int64_t batchIters = 1;
+    for (int64_t d = 0; d < batchRank; ++d)
+      batchIters *= aShape[d] / batchDims[d];
 
     SmallVector<Value> newOps;
     xegpu::DpasMxOp newDpasMxOp;
-    for (int64_t i = 0; i < mIters; ++i) {
-      for (int64_t j = 0; j < nIters; ++j) {
-        Value tmpC;
-        if (c)
-          tmpC = cVals[i * nIters + j];
+    for (int64_t batch = 0; batch < batchIters; ++batch) {
+      for (int64_t i = 0; i < mIters; ++i) {
+        for (int64_t j = 0; j < nIters; ++j) {
+          Value tmpC;
+          if (c)
+            tmpC = cVals[batch * (mIters * nIters) + i * nIters + j];
 
-        for (int64_t k = 0; k < kIters; ++k) {
-          Value aVec = aVals[i * kIters + k];
-          Value bVec = bVals[k * nIters + j];
-          SmallVector<Value> operands({aVec, bVec});
-          if (tmpC)
-            operands.push_back(tmpC);
-          if (ascale)
-            operands.push_back(aScaleVals[i * kIters + k]);
-          if (bscale)
-            operands.push_back(bScaleVals[k * nIters + j]);
+          for (int64_t k = 0; k < kIters; ++k) {
+            Value aVec =
+                aVals[batch * (mIters * kIters) + i * kIters + k];
+            Value bVec =
+                bVals[batch * (kIters * nIters) + k * nIters + j];
+            SmallVector<Value> operands({aVec, bVec});
+            if (tmpC)
+              operands.push_back(tmpC);
+            if (ascale)
+              operands.push_back(
+                  aScaleVals[batch * (mIters * kIters) + i * kIters + k]);
+            if (bscale)
+              operands.push_back(
+                  bScaleVals[batch * (kIters * nIters) + k * nIters + j]);
 
-          newDpasMxOp = xegpu::DpasMxOp::create(
-              rewriter, loc, vecTy, operands,
-              xegpu::dropInstDataOnAttrs(op->getAttrs()));
-          tmpC = newDpasMxOp.getResult();
+            newDpasMxOp = xegpu::DpasMxOp::create(
+                rewriter, loc, vecTy, operands,
+                xegpu::dropInstDataOnAttrs(op->getAttrs()));
+            tmpC = newDpasMxOp.getResult();
+          }
+          newOps.push_back(newDpasMxOp);
         }
-        newOps.push_back(newDpasMxOp);
       }
     }
     Value castOp = unpack(newOps, resultTy, cBlockSize, loc, rewriter);
