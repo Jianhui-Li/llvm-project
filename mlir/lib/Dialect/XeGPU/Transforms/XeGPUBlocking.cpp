@@ -170,11 +170,24 @@ XeGPUBlockingPass::getTileShape(Operation *op) const {
     std::optional<SmallVector<int64_t>> bTile =
         getTileShape(op->getOpOperand(1));
 
-    if (!aTile || aTile->size() != 2 || !bTile || bTile->size() != 2)
+    if (!aTile || aTile->size() < 2 || !bTile || bTile->size() < 2)
       return std::nullopt;
 
-    // semantic check for A and B
-    if ((*aTile)[1] != (*bTile)[0])
+    // Both must have the same number of batch dimensions.
+    int64_t aBatchRank = aTile->size() - 2;
+    int64_t bBatchRank = bTile->size() - 2;
+    if (aBatchRank != bBatchRank)
+      return std::nullopt;
+
+    // Batch dimensions must match.
+    for (int64_t i = 0; i < aBatchRank; ++i) {
+      if ((*aTile)[i] != (*bTile)[i])
+        return std::nullopt;
+    }
+
+    // semantic check for A and B: K dimension must match
+    // A[..., M, K] x B[..., K, N]
+    if ((*aTile).back() != (*bTile)[bBatchRank])
       return std::nullopt;
 
     return std::make_pair(*aTile, *bTile);
@@ -189,8 +202,15 @@ XeGPUBlockingPass::getTileShape(Operation *op) const {
 
     std::optional<SmallVector<int64_t>> cTile =
         getTileShape(op->getOpOperand(cOperandIdx));
-    int64_t expectedCTile[2] = {aTile[0], bTile[1]};
-    if (!cTile || !llvm::equal(*cTile, expectedCTile))
+    if (!cTile)
+      return false;
+    // Expected C tile: batch dims from A + [M, N]
+    int64_t aBatchRank = aTile.size() - 2;
+    SmallVector<int64_t> expectedCTile(aTile.begin(),
+                                       aTile.begin() + aBatchRank);
+    expectedCTile.push_back(aTile[aBatchRank]); // M from A
+    expectedCTile.push_back(bTile.back());      // N from B
+    if (!llvm::equal(*cTile, expectedCTile))
       return false;
     return true;
   };
@@ -244,7 +264,13 @@ XeGPUBlockingPass::getTileShape(Operation *op) const {
     if (!validateCTile(op, 2, aTile, bTile))
       return std::nullopt;
 
-    return SmallVector<int64_t>({aTile[0], aTile[1], bTile[1]});
+    // Return [batch..., M, K, N] as the target shape for unrolling.
+    int64_t aBatchRank = aTile.size() - 2;
+    SmallVector<int64_t> tileShape(aTile.begin(), aTile.begin() + aBatchRank);
+    tileShape.push_back(aTile[aBatchRank]);     // M
+    tileShape.push_back(aTile[aBatchRank + 1]); // K
+    tileShape.push_back(bTile.back());          // N
+    return tileShape;
   }
 
   if (auto dpasMxOp = dyn_cast<xegpu::DpasMxOp>(op)) {

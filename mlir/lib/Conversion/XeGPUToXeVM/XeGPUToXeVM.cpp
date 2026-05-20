@@ -51,10 +51,11 @@ static constexpr int32_t executionSize{16};
 
 // Offsets to individual fields of the 8xi32 layout nd tensor descriptor.
 enum class NdTdescOffset : uint32_t {
-  BasePtr = 0,    // Base pointer (i64)
-  BaseShapeW = 2, // Base shape width (i32)
-  BaseShapeH = 3, // Base shape height (i32)
-  BasePitch = 4,  // Base pitch (i32)
+  BasePtr = 0,        // Base pointer (i64)
+  BaseShapeW = 2,     // Base shape width (i32)
+  BaseShapeH = 3,     // Base shape height (i32)
+  BasePitch = 4,      // Base pitch/stride of dim rank-2 (i32)
+  BaseOuterPitch = 5, // Outer pitch/stride for dims beyond 2D (i32)
 };
 
 static int32_t getNumericXeVMAddrSpace(xegpu::MemorySpace xeGpuMemspace) {
@@ -240,11 +241,12 @@ class CreateNdDescToXeVMPattern
       val = getValueOrCreateCastToIndexLike(rewriter, loc, payloadElemTy, val);
       return val;
     };
-    // Get shape values from op fold results.
-    baseShapeW = createOffset(mixedSizes, 1);
-    baseShapeH = createOffset(mixedSizes, 0);
-    // Get pitch value from op fold results.
-    Value basePitch = createOffset(mixedStrides, 0);
+    // For ND descriptors, the last 2 dimensions are the 2D tile (H, W).
+    // Any leading dimensions are batch dims with associated strides.
+    baseShapeW = createOffset(mixedSizes, rank - 1);
+    baseShapeH = createOffset(mixedSizes, rank - 2);
+    // Pitch is the stride of dim rank-2 (the row stride of the 2D tile).
+    Value basePitch = createOffset(mixedStrides, rank - 2);
     // Populate payload.
     Value payLoadAsI64 =
         vector::BitCastOp::create(rewriter, loc, payloadI64Ty, payload);
@@ -261,6 +263,13 @@ class CreateNdDescToXeVMPattern
     payload =
         vector::InsertOp::create(rewriter, loc, basePitch, payload,
                                  static_cast<int>(NdTdescOffset::BasePitch));
+    // For rank > 2, store the outer pitch (stride of the outermost batch dim).
+    if (rank > 2) {
+      Value outerPitch = createOffset(mixedStrides, rank - 3);
+      payload = vector::InsertOp::create(
+          rewriter, loc, outerPitch, payload,
+          static_cast<int>(NdTdescOffset::BaseOuterPitch));
+    }
     rewriter.replaceOp(op, payload);
     return success();
   }
@@ -343,7 +352,7 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
     // Get address space from tensor descriptor memory space.
     auto ptrTypeLLVM = LLVM::LLVMPointerType::get(
         ctxt, getNumericXeVMAddrSpace(tdescTy.getMemorySpace()));
-    if (tileRank == 2) {
+    if (tileRank >= 2) {
       // Compute element byte size.
       Value elemByteSize = arith::ConstantIntOp::create(
           rewriter, loc, rewriter.getI32Type(), elemBitSize / 8);
@@ -359,14 +368,39 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
           rewriter, loc, tdesc, static_cast<int>(NdTdescOffset::BaseShapeH));
       Value basePitch = vector::ExtractOp::create(
           rewriter, loc, tdesc, static_cast<int>(NdTdescOffset::BasePitch));
-      // Offsets are provided by the op.
-      // convert them to i32.
-      Value offsetW =
-          getValueOrCreateConstantIntOp(rewriter, loc, mixedOffsets[1]);
+
+      // For rank > 2, compute byte offset from leading (batch) dimensions
+      // and add to the base pointer before performing the 2D operation.
+      if (tileRank > 2) {
+        Value outerPitch = vector::ExtractOp::create(
+            rewriter, loc, tdesc,
+            static_cast<int>(NdTdescOffset::BaseOuterPitch));
+        // Compute byte offset from leading dims: sum(offset[i] * stride[i])
+        // For now we support one extra outer dim (3D total).
+        Value outerOffset =
+            getValueOrCreateConstantIntOp(rewriter, loc, mixedOffsets[0]);
+        outerOffset = getValueOrCreateCastToIndexLike(
+            rewriter, loc, rewriter.getI32Type(), outerOffset);
+        // outerPitch is in elements; convert to bytes.
+        Value outerPitchBytes =
+            arith::MulIOp::create(rewriter, loc, outerPitch, elemByteSize);
+        Value outerByteOffset =
+            arith::MulIOp::create(rewriter, loc, outerOffset, outerPitchBytes);
+        // Extend to i64 and add to base pointer.
+        Value outerByteOffset64 = arith::ExtSIOp::create(
+            rewriter, loc, rewriter.getI64Type(), outerByteOffset);
+        basePtr =
+            arith::AddIOp::create(rewriter, loc, basePtr, outerByteOffset64);
+      }
+
+      // Offsets for the innermost 2D tile.
+      // For rank > 2, the 2D offsets are the last 2 elements of mixedOffsets.
+      Value offsetW = getValueOrCreateConstantIntOp(rewriter, loc,
+                                                    mixedOffsets[tileRank - 1]);
       offsetW = getValueOrCreateCastToIndexLike(rewriter, loc,
                                                 rewriter.getI32Type(), offsetW);
-      Value offsetH =
-          getValueOrCreateConstantIntOp(rewriter, loc, mixedOffsets[0]);
+      Value offsetH = getValueOrCreateConstantIntOp(rewriter, loc,
+                                                    mixedOffsets[tileRank - 2]);
       offsetH = getValueOrCreateCastToIndexLike(rewriter, loc,
                                                 rewriter.getI32Type(), offsetH);
       // Convert base pointer (i64) to LLVM pointer type.
@@ -393,8 +427,8 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
         offsetW =
             arith::ShRSIOp::create(rewriter, loc, offsetW, wScaleFactorValLog2);
       }
-      // Get tile height from the tensor descriptor type.
-      auto tileH = tdescTy.getDimSize(0);
+      // Get tile height from the tensor descriptor type (second-to-last dim).
+      auto tileH = tdescTy.getDimSize(tileRank - 2);
       // Get vblocks from the tensor descriptor type.
       int32_t vblocks = tdescTy.getArrayLength();
       if constexpr (std::is_same_v<OpType, xegpu::StoreNdOp>) {
