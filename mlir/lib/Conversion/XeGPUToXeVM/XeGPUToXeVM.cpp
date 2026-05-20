@@ -51,11 +51,10 @@ static constexpr int32_t executionSize{16};
 
 // Offsets to individual fields of the 8xi32 layout nd tensor descriptor.
 enum class NdTdescOffset : uint32_t {
-  BasePtr = 0,        // Base pointer (i64)
-  BaseShapeW = 2,     // Base shape width (i32)
-  BaseShapeH = 3,     // Base shape height (i32)
-  BasePitch = 4,      // Base pitch/stride of dim rank-2 (i32)
-  BaseOuterPitch = 5, // Outer pitch/stride for dims beyond 2D (i32)
+  BasePtr = 0,    // Base pointer (i64)
+  BaseShapeW = 2, // Base shape width (i32)
+  BaseShapeH = 3, // Base shape height (i32)
+  BasePitch = 4,  // Base pitch/stride of dim rank-2 (i32)
 };
 
 static int32_t getNumericXeVMAddrSpace(xegpu::MemorySpace xeGpuMemspace) {
@@ -263,13 +262,6 @@ class CreateNdDescToXeVMPattern
     payload =
         vector::InsertOp::create(rewriter, loc, basePitch, payload,
                                  static_cast<int>(NdTdescOffset::BasePitch));
-    // For rank > 2, store the outer pitch (stride of the outermost batch dim).
-    if (rank > 2) {
-      Value outerPitch = createOffset(mixedStrides, rank - 3);
-      payload = vector::InsertOp::create(
-          rewriter, loc, outerPitch, payload,
-          static_cast<int>(NdTdescOffset::BaseOuterPitch));
-    }
     rewriter.replaceOp(op, payload);
     return success();
   }
@@ -369,32 +361,9 @@ class LoadStorePrefetchNdToXeVMPattern : public OpConversionPattern<OpType> {
       Value basePitch = vector::ExtractOp::create(
           rewriter, loc, tdesc, static_cast<int>(NdTdescOffset::BasePitch));
 
-      // For rank > 2, compute byte offset from leading (batch) dimensions
-      // and add to the base pointer before performing the 2D operation.
-      if (tileRank > 2) {
-        Value outerPitch = vector::ExtractOp::create(
-            rewriter, loc, tdesc,
-            static_cast<int>(NdTdescOffset::BaseOuterPitch));
-        // Compute byte offset from leading dims: sum(offset[i] * stride[i])
-        // For now we support one extra outer dim (3D total).
-        Value outerOffset =
-            getValueOrCreateConstantIntOp(rewriter, loc, mixedOffsets[0]);
-        outerOffset = getValueOrCreateCastToIndexLike(
-            rewriter, loc, rewriter.getI32Type(), outerOffset);
-        // outerPitch is in elements; convert to bytes.
-        Value outerPitchBytes =
-            arith::MulIOp::create(rewriter, loc, outerPitch, elemByteSize);
-        Value outerByteOffset =
-            arith::MulIOp::create(rewriter, loc, outerOffset, outerPitchBytes);
-        // Extend to i64 and add to base pointer.
-        Value outerByteOffset64 = arith::ExtSIOp::create(
-            rewriter, loc, rewriter.getI64Type(), outerByteOffset);
-        basePtr =
-            arith::AddIOp::create(rewriter, loc, basePtr, outerByteOffset64);
-      }
-
-      // Offsets for the innermost 2D tile.
-      // For rank > 2, the 2D offsets are the last 2 elements of mixedOffsets.
+      // For rank > 2, leading (batch) dim offsets should be 0 after unrolling
+      // (batch is baked into the base pointer via memref.subview during
+      // blocking). Use only the last 2 offsets for the 2D block operation.
       Value offsetW = getValueOrCreateConstantIntOp(rewriter, loc,
                                                     mixedOffsets[tileRank - 1]);
       offsetW = getValueOrCreateCastToIndexLike(rewriter, loc,
