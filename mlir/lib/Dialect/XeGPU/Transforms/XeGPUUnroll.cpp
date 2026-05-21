@@ -223,7 +223,7 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
     batchBlockSize.append(shape.begin() + batchRank, shape.end());
 
     auto newTdescTy =
-        cast<xegpu::TensorDescType>(getUnrolledTypes(tdescTy, batchBlockSize)[0]);
+        cast<xegpu::TensorDescType>(getUnrolledTypes(tdescTy, *targetShape)[0]);
 
     SmallVector<Value> newOps;
     for (SmallVector<int64_t> batchOffsets :
