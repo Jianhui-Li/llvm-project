@@ -213,11 +213,12 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
     // For rank > 2 with memref source: create one tdesc per batch tile via
     // memref.subview. Each subview slices the batch dimensions, so the
     // resulting tdesc has the batch offset baked into its base pointer.
+    // The inner dimensions remain full-size for reuse across multiple
+    // load/store operations with different offsets.
     ArrayRef<int64_t> shape = tdescTy.getShape();
     SmallVector<int64_t> batchShape(shape.begin(), shape.begin() + batchRank);
     SmallVector<int64_t> batchTarget(targetShape->begin(),
                                      targetShape->begin() + batchRank);
-    // batchBlockSize = [batchTarget..., innerShape...] — one batch slice.
     SmallVector<int64_t> batchBlockSize(batchTarget);
     batchBlockSize.append(shape.begin() + batchRank, shape.end());
 
@@ -227,26 +228,23 @@ struct UnrollCreateNdOp : public UnrollPattern<xegpu::CreateNdDescOp> {
     SmallVector<Value> newOps;
     for (SmallVector<int64_t> batchOffsets :
          StaticTileOffsetRange(batchShape, batchTarget)) {
-      // Build subview offsets: [batchOffset0, ..., 0, 0]
       SmallVector<OpFoldResult> svOffsets;
       for (int64_t i = 0; i < batchRank; ++i)
         svOffsets.push_back(rewriter.getIndexAttr(batchOffsets[i]));
       for (int64_t i = 0; i < 2; ++i)
         svOffsets.push_back(rewriter.getIndexAttr(0));
 
-      // Build subview sizes matching batchBlockSize.
       SmallVector<OpFoldResult> svSizes;
       for (int64_t d : batchBlockSize)
         svSizes.push_back(rewriter.getIndexAttr(d));
 
-      // Strides all 1.
       SmallVector<OpFoldResult> svStrides(rank, rewriter.getIndexAttr(1));
 
       auto subview = memref::SubViewOp::create(rewriter, loc, op.getSource(),
                                                svOffsets, svSizes, svStrides);
       auto newOp = xegpu::CreateNdDescOp::create(
-          rewriter, loc, newTdescTy, subview.getResult(),
-          SmallVector<OpFoldResult>(), SmallVector<OpFoldResult>());
+          rewriter, loc, newTdescTy,
+          cast<TypedValue<MemRefType>>(subview.getResult()));
       newOps.push_back(newOp);
     }
 
@@ -289,6 +287,8 @@ struct UnrollPrefetchNdOp : public UnrollPattern<xegpu::PrefetchNdOp> {
       computeUnrolledOffsets(op.getMixedOffsets(), tdescTy, *targetShape,
                              createPrefetch, loc, rewriter);
     } else {
+      // Rank > 2: batch tdescs cover [batchTarget..., innerShape...].
+      // Each batch tdesc is reused for multiple inner prefetches via offsets.
       ArrayRef<int64_t> shape = tdescTy.getShape();
       SmallVector<int64_t> batchTarget(targetShape->begin(),
                                        targetShape->begin() + batchRank);
@@ -299,27 +299,32 @@ struct UnrollPrefetchNdOp : public UnrollPattern<xegpu::PrefetchNdOp> {
       batchBlockSize.append(innerShape.begin(), innerShape.end());
 
       SmallVector<Type> batchTdescTypes =
-          getUnrolledTypes(tdescTy, batchBlockSize, /*returnSingleType*/ true);
+          getUnrolledTypes(tdescTy, batchBlockSize);
       SmallVector<Value> batchTdescs = pack(
           op.getTensorDesc(), batchTdescTypes, batchBlockSize, loc, rewriter);
 
-      Type innerElemTy = tdescTy.getElementType();
       auto innerTdescTy = xegpu::TensorDescType::get(
-          tdescTy.getContext(), innerShape, innerElemTy, tdescTy.getEncoding(),
-          /*layout=*/nullptr);
+          tdescTy.getContext(), innerShape, tdescTy.getElementType(),
+          tdescTy.getEncoding(), /*layout=*/nullptr);
 
       SmallVector<OpFoldResult> mixedOffsets = op.getMixedOffsets();
       SmallVector<OpFoldResult> innerOffsets(mixedOffsets.begin() + batchRank,
                                             mixedOffsets.end());
 
       for (auto batchTdesc : batchTdescs) {
+        SmallVector<Type> innerTdescTypes =
+            getUnrolledTypes(tdescTy, *targetShape, /*returnSingleType*/ true);
+        SmallVector<Value> innerTdescs =
+            pack(batchTdesc, innerTdescTypes, *targetShape, loc, rewriter);
+
         auto createPrefetch = [&](SmallVector<OpFoldResult> offsets) -> Value {
           SmallVector<OpFoldResult> fullOffsets(batchRank,
                                                rewriter.getIndexAttr(0));
           fullOffsets.append(offsets.begin(), offsets.end());
-          xegpu::PrefetchNdOp::create(rewriter, loc, batchTdesc, fullOffsets,
-                                      op.getL1HintAttr(), op.getL2HintAttr(),
-                                      op.getL3HintAttr(), layout);
+          xegpu::PrefetchNdOp::create(rewriter, loc, innerTdescs[0],
+                                      fullOffsets, op.getL1HintAttr(),
+                                      op.getL2HintAttr(), op.getL3HintAttr(),
+                                      layout);
           return nullptr;
         };
         computeUnrolledOffsets(innerOffsets, innerTdescTy, innerTarget,
@@ -372,8 +377,8 @@ struct UnrollLoadNdOp : public UnrollPattern<xegpu::LoadNdOp> {
       newOps = computeUnrolledOffsets(op.getMixedOffsets(), tdescTy,
                                       *targetShape, createLoad, loc, rewriter);
     } else {
-      // Rank > 2: use per-batch tdescs. Pack using batchBlockSize to match
-      // the UnrollCreateNdOp's unpack block size.
+      // Rank > 2: batch tdescs cover [batchTarget..., innerShape...].
+      // Each batch tdesc is reused for multiple inner loads via offsets.
       ArrayRef<int64_t> shape = tdescTy.getShape();
       SmallVector<int64_t> batchTarget(targetShape->begin(),
                                        targetShape->begin() + batchRank);
@@ -384,28 +389,32 @@ struct UnrollLoadNdOp : public UnrollPattern<xegpu::LoadNdOp> {
       batchBlockSize.append(innerShape.begin(), innerShape.end());
 
       SmallVector<Type> batchTdescTypes =
-          getUnrolledTypes(tdescTy, batchBlockSize, /*returnSingleType*/ true);
+          getUnrolledTypes(tdescTy, batchBlockSize);
       SmallVector<Value> batchTdescs = pack(
           op.getTensorDesc(), batchTdescTypes, batchBlockSize, loc, rewriter);
 
-      // Create an inner-only tdesc type for computing inner 2D offsets.
+      // For each batch tdesc, pack it down to a single targetShape-sized
+      // tdesc and iterate with inner offsets (reusing the same tdesc).
       auto innerTdescTy = xegpu::TensorDescType::get(
           tdescTy.getContext(), innerShape, elemTy, tdescTy.getEncoding(),
           /*layout=*/nullptr);
 
-      // Extract inner offsets from the original mixed offsets.
       SmallVector<OpFoldResult> mixedOffsets = op.getMixedOffsets();
       SmallVector<OpFoldResult> innerOffsets(mixedOffsets.begin() + batchRank,
                                             mixedOffsets.end());
 
       for (auto batchTdesc : batchTdescs) {
+        SmallVector<Type> innerTdescTypes =
+            getUnrolledTypes(tdescTy, *targetShape, /*returnSingleType*/ true);
+        SmallVector<Value> innerTdescs =
+            pack(batchTdesc, innerTdescTypes, *targetShape, loc, rewriter);
+
         auto createLoad = [&](SmallVector<OpFoldResult> offsets) {
-          // Prepend zero offsets for batch dims.
           SmallVector<OpFoldResult> fullOffsets(batchRank,
                                                rewriter.getIndexAttr(0));
           fullOffsets.append(offsets.begin(), offsets.end());
           return xegpu::LoadNdOp::create(
-              rewriter, loc, newValueTy, batchTdesc, fullOffsets,
+              rewriter, loc, newValueTy, innerTdescs[0], fullOffsets,
               op.getPackedAttr(), op.getTransposeAttr(), op.getL1HintAttr(),
               op.getL2HintAttr(), op.getL3HintAttr(), layout);
         };
@@ -463,6 +472,8 @@ struct UnrollStoreNdOp : public UnrollPattern<xegpu::StoreNdOp> {
       computeUnrolledOffsets(op.getMixedOffsets(), tdescTy, *targetShape,
                              createStore, loc, rewriter);
     } else {
+      // Rank > 2: batch tdescs cover [batchTarget..., innerShape...].
+      // Each batch tdesc is reused for multiple inner stores via offsets.
       ArrayRef<int64_t> shape = tdescTy.getShape();
       SmallVector<int64_t> batchTarget(targetShape->begin(),
                                        targetShape->begin() + batchRank);
@@ -473,29 +484,33 @@ struct UnrollStoreNdOp : public UnrollPattern<xegpu::StoreNdOp> {
       batchBlockSize.append(innerShape.begin(), innerShape.end());
 
       SmallVector<Type> batchTdescTypes =
-          getUnrolledTypes(tdescTy, batchBlockSize, /*returnSingleType*/ true);
+          getUnrolledTypes(tdescTy, batchBlockSize);
       SmallVector<Value> batchTdescs = pack(
           op.getTensorDesc(), batchTdescTypes, batchBlockSize, loc, rewriter);
 
-      Type innerElemTy = tdescTy.getElementType();
       auto innerTdescTy = xegpu::TensorDescType::get(
-          tdescTy.getContext(), innerShape, innerElemTy, tdescTy.getEncoding(),
-          /*layout=*/nullptr);
+          tdescTy.getContext(), innerShape, tdescTy.getElementType(),
+          tdescTy.getEncoding(), /*layout=*/nullptr);
 
       SmallVector<OpFoldResult> mixedOffsets = op.getMixedOffsets();
       SmallVector<OpFoldResult> innerOffsets(mixedOffsets.begin() + batchRank,
                                             mixedOffsets.end());
 
       for (auto batchTdesc : batchTdescs) {
+        SmallVector<Type> innerTdescTypes =
+            getUnrolledTypes(tdescTy, *targetShape, /*returnSingleType*/ true);
+        SmallVector<Value> innerTdescs =
+            pack(batchTdesc, innerTdescTypes, *targetShape, loc, rewriter);
+
         auto createStore = [&](SmallVector<OpFoldResult> offsets) {
           SmallVector<OpFoldResult> fullOffsets(batchRank,
                                                rewriter.getIndexAttr(0));
           fullOffsets.append(offsets.begin(), offsets.end());
           xegpu::StoreNdOp::create(rewriter, loc,
-                                   convertedValues[valueIndex++], batchTdesc,
-                                   fullOffsets, op.getL1HintAttr(),
-                                   op.getL2HintAttr(), op.getL3HintAttr(),
-                                   layout);
+                                   convertedValues[valueIndex++],
+                                   innerTdescs[0], fullOffsets,
+                                   op.getL1HintAttr(), op.getL2HintAttr(),
+                                   op.getL3HintAttr(), layout);
           return (Value) nullptr;
         };
         computeUnrolledOffsets(innerOffsets, innerTdescTy, innerTarget,
