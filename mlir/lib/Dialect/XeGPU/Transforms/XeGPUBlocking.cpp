@@ -44,36 +44,57 @@ resolveUnrealizedConversionCastOp(UnrealizedConversionCastOp castOp) {
   ValueRange inputs = castOp.getInputs();
   ValueRange outputs = castOp.getOutputs();
 
-  auto hasIdenticalVectorTypes = [](ValueRange values) {
+  auto hasIdenticalVectorOrTdescTypes = [](ValueRange values) {
     auto types = values.getTypes();
     return llvm::all_of(types, [&](Type type) {
-      return isa<VectorType>(type) && type == types.front();
+      return (isa<VectorType>(type) || isa<xegpu::TensorDescType>(type)) &&
+             type == types.front();
     });
   };
 
   // We only interest in the case where all inputs and outputs have the
   // identical VectorTypes
-  if (!hasIdenticalVectorTypes(inputs) || !hasIdenticalVectorTypes(outputs)) {
+  if (!hasIdenticalVectorOrTdescTypes(inputs) ||
+      !hasIdenticalVectorOrTdescTypes(outputs)) {
     LDBG() << "skip unrealized conversion cast op not emulating pack/unpack.";
     return;
   }
 
   VectorType outputTy = dyn_cast<VectorType>(outputs[0].getType());
-  OpBuilder builder(castOp);
-  if (inputs.size() > 1 && outputs.size() == 1) {
-    // the castOp is emulating an unpack op
-    ArrayRef<int64_t> shape = outputTy.getShape();
-    Value result = xegpu::createVectorWithShapeFromValues(
-        builder, castOp.getLoc(), inputs, shape);
-    castOp->replaceAllUsesWith(ValueRange(result));
-    castOp->erase();
-  } else if (castOp.getNumResults() > 1 && castOp.getNumOperands() == 1) {
-    // the castOp is emulating a pack op
-    ArrayRef<int64_t> tileShape = outputTy.getShape();
-    SmallVector<Value> results = xegpu::extractVectorsWithShapeFromValue(
-        builder, castOp.getLoc(), inputs[0], tileShape);
-    castOp->replaceAllUsesWith(results);
-    castOp->erase();
+  if (outputTy) {
+    OpBuilder builder(castOp);
+    if (inputs.size() > 1 && outputs.size() == 1) {
+      // the castOp is emulating an unpack op
+      ArrayRef<int64_t> shape = outputTy.getShape();
+      Value result = xegpu::createVectorWithShapeFromValues(
+          builder, castOp.getLoc(), inputs, shape);
+      castOp->replaceAllUsesWith(ValueRange(result));
+      castOp->erase();
+    } else if (castOp.getNumResults() > 1 && castOp.getNumOperands() == 1) {
+      // the castOp is emulating a pack op
+      ArrayRef<int64_t> tileShape = outputTy.getShape();
+      SmallVector<Value> results = xegpu::extractVectorsWithShapeFromValue(
+          builder, castOp.getLoc(), inputs[0], tileShape);
+      castOp->replaceAllUsesWith(results);
+      castOp->erase();
+    }
+  } else {
+    if (castOp.getNumResults() > 1 && castOp.getNumOperands() == 1) {
+      if (auto prevCastOp =
+              inputs[0].getDefiningOp<UnrealizedConversionCastOp>()) {
+        if (prevCastOp.getNumResults() == 1 &&
+            prevCastOp.getNumOperands() > 1 &&
+            prevCastOp.getOutputs()[0].getType() ==
+                castOp.getInputs()[0].getType()) {
+          castOp->replaceAllUsesWith(prevCastOp.getInputs());
+          castOp->erase();
+          prevCastOp->erase();
+          return;
+        }
+      }
+    }
+
+    LDBG() << "skip unrealized conversion cast op not emulating pack/unpack.";
   }
 }
 
@@ -468,24 +489,25 @@ void XeGPUBlockingPass::runOnOperation() {
 
   options.setNativeShapeFn([&](Operation *op) { return getTileShape(op); });
 
-  options.setUnrolledTypesFn([&](ShapedType type, ArrayRef<int64_t> tileShape,
-                                 bool returnSingleType = false) {
+  options.setUnrolledTypesFn([&](ShapedType type, ArrayRef<int64_t> tileShape) {
     Type elemTy = type.getElementType();
-    Type newTy;
 
     if (auto tdescTy = dyn_cast<xegpu::TensorDescType>(type)) {
 
       Attribute encoding = tdescTy.getEncoding();
 
-      newTy =
+      xegpu::TensorDescType newTy =
           xegpu::TensorDescType::get(ctx, tileShape, elemTy, encoding,
                                      tdescTy.getLayoutAttr().dropInstData());
-    } else {
-      newTy = VectorType::get(tileShape, elemTy);
+      // compute the product of batch (higher) dimensions
+      ArrayRef<int64_t> shape = type.getShape();
+      int64_t batchCount =
+          shape.size() > 2 ? computeProduct(shape.drop_back(2)) : 1;
+      return SmallVector<Type>(batchCount, newTy);
     }
+    Type newTy;
+    newTy = VectorType::get(tileShape, elemTy);
 
-    if (returnSingleType)
-      return SmallVector<Type>{newTy};
     std::optional<SmallVector<int64_t>> ratio =
         computeShapeRatio(type.getShape(), tileShape);
     assert(ratio && "The shape of the type must be a multiple of tileShape.");
