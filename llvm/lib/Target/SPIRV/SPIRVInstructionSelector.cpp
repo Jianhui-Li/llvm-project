@@ -7398,9 +7398,28 @@ bool SPIRVInstructionSelector::selectLog10(Register ResVReg,
 bool SPIRVInstructionSelector::selectFpowi(Register ResVReg,
                                            SPIRVTypeInst ResType,
                                            MachineInstr &I) const {
-  // On OpenCL targets, pown(gentype x, intn n) maps directly.
-  if (STI.canUseExtInstSet(SPIRV::InstructionSet::OpenCL_std))
-    return selectExtInst(ResVReg, ResType, I, CL::pown);
+  // On OpenCL targets, pown(gentype x, intn n) maps directly -- but `intn` is
+  // always 32-bit, whereas llvm.powi is overloaded on the exponent type. Narrow
+  // or widen a differently-sized exponent with OpSConvert first (the exponent
+  // is signed); emitting pown with, say, a 64-bit operand yields a call no
+  // OpenCL consumer can resolve.
+  if (STI.canUseExtInstSet(SPIRV::InstructionSet::OpenCL_std)) {
+    Register BaseReg = I.getOperand(1).getReg();
+    Register ExpReg = I.getOperand(2).getReg();
+    SPIRVTypeInst ExpType = GR.getSPIRVTypeForVReg(ExpReg);
+    if (!ExpType)
+      return false;
+    if (GR.getScalarOrVectorBitWidth(ExpType) == 32)
+      return selectExtInst(ResVReg, ResType, I, CL::pown);
+
+    SPIRVTypeInst I32Type = GR.getOrCreateSPIRVIntegerType(32, I, TII);
+    Register I32ExpReg = MRI->createVirtualRegister(GR.getRegClass(I32Type));
+    if (!selectOpWithSrcs(I32ExpReg, I32Type, I, {ExpReg}, SPIRV::OpSConvert))
+      return false;
+    return selectExtInst(ResVReg, ResType, I, CL::pown,
+                         /*setMIFlags=*/true, /*useMISrc=*/false,
+                         {BaseReg, I32ExpReg});
+  }
 
   // On GLSL (Vulkan) targets, there is no integer-exponent power instruction.
   // Lower as: Pow(base, OpConvertSToF(exp)).
