@@ -59,7 +59,7 @@ gpu.func @load_nd_packed() {
 // CHECK: %[[CAST:.*]] = vector.shape_cast %[[LOAD]] : vector<8xf32> to vector<8x1xf32>
 gpu.func @load_nd_f32_packed_layout_no_vnni() {
   %c0 = arith.constant 0 : index
-  %0 = "some_op"() : () -> !xegpu.tensor_desc<8x16xf32>
+  %0 = "test.some_op"() : () -> !xegpu.tensor_desc<8x16xf32>
   %1 = xegpu.load_nd %0[%c0, %c0] <{layout = #xegpu.layout<lane_layout = [1, 16], lane_data = [8, 1]>}>
     : !xegpu.tensor_desc<8x16xf32> -> vector<8x16xf32>
   gpu.return
