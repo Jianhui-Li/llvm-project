@@ -176,7 +176,16 @@ struct SgToLaneLoadNd : public OpConversionPattern<xegpu::LoadNdOp> {
         op.getTransposeAttr(), op.getL1HintAttr(), op.getL2HintAttr(),
         op.getL3HintAttr(), /**layout**/ nullptr);
     // Set the packed attribute if the layout requires it.
-    newOp.setPacked(xegpu::requirePacked(cast<xegpu::LayoutAttr>(layout)));
+    // pack_register requests VNNI register packing, which exists only for
+    // sub-32-bit types: it packs 32/elemBits sub-dword elements into one 32-bit
+    // register for DPAS. On a wider type, lane_data[0] != 1 means something
+    // else entirely, a plain block load whose lane holds several rows, and
+    // setting the flag there produces an invalid xevm.blockload2d.
+    Type elemTy = op.getTensorDescType().getElementType();
+    bool isSubDword =
+        elemTy.isIntOrFloat() && elemTy.getIntOrFloatBitWidth() < 32;
+    newOp.setPacked(isSubDword &&
+                    xegpu::requirePacked(cast<xegpu::LayoutAttr>(layout)));
     // Set the transpose attribute if the layout requires it.
     if (xegpu::requireTranspose(cast<xegpu::LayoutAttr>(layout), uArch))
       newOp.setTranspose(DenseI64ArrayAttr::get(rewriter.getContext(), {1, 0}));

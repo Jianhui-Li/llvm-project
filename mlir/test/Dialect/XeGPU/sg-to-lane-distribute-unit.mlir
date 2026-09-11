@@ -48,6 +48,23 @@ gpu.func @load_nd_packed() {
   gpu.return
 }
 
+// lane_data = [8, 1] on an f32 tile means each lane holds 8 rows of a plain
+// block load, not VNNI packing, which exists only for sub-32-bit elements. The
+// lowered load_nd must stay unpacked; the packed flag would produce an
+// xevm.blockload2d the verifier rejects.
+// CHECK-LABEL: gpu.func @load_nd_f32_packed_layout_no_vnni
+// CHECK: %[[C0:.*]] = arith.constant 0 : index
+// CHECK: %[[LOAD:.*]] = xegpu.load_nd %{{.*}}[%[[C0]], %[[C0]]] : !xegpu.tensor_desc<8x16xf32> -> vector<8xf32>
+// CHECK-NOT: packed
+// CHECK: %[[CAST:.*]] = vector.shape_cast %[[LOAD]] : vector<8xf32> to vector<8x1xf32>
+gpu.func @load_nd_f32_packed_layout_no_vnni() {
+  %c0 = arith.constant 0 : index
+  %0 = "some_op"() : () -> !xegpu.tensor_desc<8x16xf32>
+  %1 = xegpu.load_nd %0[%c0, %c0] <{layout = #xegpu.layout<lane_layout = [1, 16], lane_data = [8, 1]>}>
+    : !xegpu.tensor_desc<8x16xf32> -> vector<8x16xf32>
+  gpu.return
+}
+
 // CHECK-LABEL: gpu.func @load_nd_transpose
 // CHECK: %[[C0:.*]] = arith.constant 0 : index
 // CHECK: %[[LOAD:.*]] = xegpu.load_nd %{{.*}}[%[[C0]], %[[C0]]] <{transpose = array<i64: 1, 0>}> : !xegpu.tensor_desc<16x8xf32> -> vector<8xf32>
