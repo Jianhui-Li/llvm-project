@@ -1259,36 +1259,55 @@ compute2DBlockIOLaneLayout(ArrayRef<int64_t> instShape, int64_t subgroupSize,
 }
 
 /// Computes a multi_reduction's source layout as (lane_layout, lane_data,
-/// inst_data), where inst_data = lane_layout * lane_data on every dim.
+/// inst_data), with one entry per source dimension. lane_layout describes the
+/// lanes along each dimension; lane_data describes the elements packed per
+/// lane. `maxReduceVectorSize` limits additional packing based on the total
+/// per-lane element count, product(lane_data).
 ///
-/// `maxReduceVectorSize` is the per-lane vector budget.
+/// 1. Reuse the consumer's slice parent when the slice dimensions exactly match
+///    `reductionDims`, the parent has the source rank, and
+///    product(parent.lane_layout) == `subgroupSize`. Take the parent's
+///    lane_layout and lane_data as the starting point and keep its inst_data
+///    aside for rule 4. Then cap lane_layout[i] by
+///    max(1, srcShape[i] / lane_data[i]), accounting for the elements already
+///    packed into each lane: the parent sized its reduction dimensions against
+///    the dimensions the consumer sliced away, whose extents are not the
+///    source's. Rules 2 and 3 still apply.
 ///
-/// 1. Take lane_layout and lane_data from the consumer. A consumer sliced over
-///    exactly `reductionDims` is a view of a source-rank parent, and that
-///    parent is reused as-is. Any other consumer has the result's rank: its
-///    lane_layout and lane_data hold one element per surviving dim, taken in
-///    order. Reduced dims keep lane_layout 1 for now.
+/// 2. Without a reused parent, start with lane_layout and lane_data equal to 1
+///    and copy the consumer's effective entries to the non-reduced source
+///    dimensions in order. Reduced dimensions and missing entries remain 1.
+///    No cap is needed here: a reduced dimension holds one lane, and a
+///    surviving one takes its lanes from a consumer that shares the source's
+///    extent along it.
 ///
-/// 2. Limit lane_layout by `srcShape`: a dim can spread over no more lanes than
-///    it has elements to give.
+///    If the innermost source dimension is reduced, assign it any remaining
+///    subgroup lanes, capped by max(1, srcShape / lane_data) as above.
+///    Otherwise, those lanes remain unused. This heuristic favors the innermost
+///    dimension because memory loads and DPAS results typically already
+///    distribute it across lanes.
 ///
-///    Then hand any unused lanes to the innermost dim, if that dim is reduced.
-///    This is a heuristic: the innermost dim of the source typically already
-///    carries several lanes, whether the source is loaded from memory or is a
-///    dpas result, so putting them there matches what the producer did.
+/// 3. If the innermost dimension is reduced, has extent greater than 1, and
+///    has lane_layout == 1, increase its lane_data to enable vector reduction
+///    within each lane. Multiply its existing lane_data to reach
+///    maxReduceVectorSize, and cap the result by its source extent.
+///    Existing packing across all dimensions consumes the budget first; if
+///    it already meets or exceeds the budget, lane_data is unchanged.
 ///
-/// 3. Raise lane_data on the innermost dim, so the lane holds a run of elements
-///    along it and reduces the run with one vector op instead of one element at
-///    a time. The run is at most `maxReduceVectorSize` long. The dim must also
-///    be reduced and have lane_layout 1.
+/// 4. Compute inst_data[i] = lane_layout[i] * lane_data[i]. On a non-reduced
+///    dimension, a parent reused by rule 1 raises it to the parent's own
+///    inst_data when that is wider, a whole multiple of the footprint, and
+///    divides `srcShape`: blocking wider than one row of lanes is legal
+///    (inst_data = k * lane_layout * lane_data), and the parent's extents on
+///    those dimensions are the source's. A reduced dimension keeps the
+///    footprint, since rules 2 and 3 have just re-spent its lanes.
 ///
-///    How much: `maxReduceVectorSize / product(lane_data)`, multiplied onto the
-///    dim's existing lane_data and capped by its extent.
-///
-/// e.g. src=[16,32,32] reduce [2], consumer lane=[1,2] ->
-/// lane_layout=[1,2,8], lane_data=[1,1,1], inst_data=[1,2,8].
-/// e.g. src=[16,16] reduce [1], consumer lane=[16] ->
-/// lane_layout=[16,1], lane_data=[1,16], inst_data=[16,16].
+/// Examples with subgroupSize = 16, maxReduceVectorSize = 16, consumer
+/// lane_data all 1, and no reused slice parent:
+///   src=[16,32,32], reductionDims=[2], consumer lane_layout=[1,2]
+///     -> lane_layout=[1,2,8], lane_data=[1,1,1], inst_data=[1,2,8].
+///   src=[16,16], reductionDims=[1], consumer lane_layout=[16]
+///     -> lane_layout=[16,1], lane_data=[1,16], inst_data=[16,16].
 static std::tuple<SmallVector<int64_t>, SmallVector<int64_t>,
                   SmallVector<int64_t>>
 computeReductionLaneLayoutAndData(
@@ -1301,9 +1320,10 @@ computeReductionLaneLayoutAndData(
     return llvm::is_contained(reductionDims, dim);
   };
 
-  // Rule 1. Only a parent that covers the source rank and spends the whole
-  // subgroup is trusted; one spending less distributes less than the producer
-  // already does.
+  // Rule 1. Reuse the matching slice's source-rank parent only when its
+  // lane_layout uses the entire subgroup. Its inst_data is kept aside for
+  // rule 4.
+  SmallVector<int64_t> parentInstData;
   auto consumerSlice = dyn_cast_if_present<xegpu::SliceAttr>(consumerLayout);
   bool reusedParent = false;
   if (consumerSlice &&
@@ -1318,9 +1338,26 @@ computeReductionLaneLayoutAndData(
       laneLayout = std::move(parentLaneLayout);
       laneData = std::move(parentLaneData);
       reusedParent = true;
+      parentInstData = parent.getEffectiveInstDataAsInt();
+      if (static_cast<int>(parentInstData.size()) != srcRank)
+        parentInstData.clear();
+
+      // The parent sized its reduction dims against the dims the consumer
+      // sliced away, whose extents are not the source's -- a dim can spread
+      // over no more lanes than the source has elements to give it. Only the
+      // reuse path needs this: elsewhere a reduced dim starts at one lane, and
+      // a surviving dim takes its lanes from a consumer that shares the
+      // source's extent along it.
+      for (int i = 0; i < srcRank; ++i)
+        laneLayout[i] = std::min(
+            laneLayout[i], std::max<int64_t>(1, srcShape[i] / laneData[i]));
     }
   }
 
+  // Rule 2. Copy the consumer's effective lane_layout and lane_data onto the
+  // non-reduced source dimensions in order; reduced dimensions and missing
+  // entries stay at 1. These values need no bound against srcShape -- a
+  // surviving dim's consumer shares the source's extent along it.
   if (!reusedParent) {
     SmallVector<int64_t> consumerLaneLayout, consumerLaneData;
     if (consumerLayout) {
@@ -1338,24 +1375,19 @@ computeReductionLaneLayoutAndData(
     }
   }
 
-  // Rule 2, applied to a reused parent as much as a derived layout.
-  SmallVector<int64_t> maxLanes(srcRank);
-  for (int i = 0; i < srcRank; ++i) {
-    maxLanes[i] = std::max<int64_t>(1, srcShape[i] / laneData[i]);
-    laneLayout[i] = std::min(laneLayout[i], maxLanes[i]);
-  }
-
-  // Lanes the consumer never claimed, plus any the bound above freed, go to the
-  // innermost dim -- and only when it is reduced.
+  // Lanes no dim has claimed go to the innermost one, and only when it is
+  // reduced; it can hold no more of them than it has elements to give.
   // TODO: spend these lanes on an outer reduced dim once that is lowerable --
   // they sit idle today. Widening it to srcRank-2 breaks
   // reduction_2D_scalar_cross_sg_intra_lane.
   int innermost = srcRank - 1;
+  int64_t maxInnermostLanes =
+      std::max<int64_t>(1, srcShape[innermost] / laneData[innermost]);
   int64_t spareLanes =
       std::max<int64_t>(1, subgroupSize / computeProduct(laneLayout));
   if (spareLanes > 1 && isReduced(innermost))
     laneLayout[innermost] =
-        std::min(laneLayout[innermost] * spareLanes, maxLanes[innermost]);
+        std::min(laneLayout[innermost] * spareLanes, maxInnermostLanes);
 
   // Rule 3. What lane_data already packs comes off the budget first.
   int64_t vectorBudget =
@@ -1369,9 +1401,23 @@ computeReductionLaneLayoutAndData(
     laneData[innermost] =
         std::min(vectorBudget * laneData[innermost], srcShape[innermost]);
 
+  // Rule 4. inst_data is the lane footprint, except that a parent reused by
+  // rule 1 lends its own blocking on the non-reduced dimensions, where its
+  // extents are the source's. A reduction dimension keeps the footprint: the
+  // parent's entry there describes the dimension the consumer sliced away, and
+  // rules 2 and 3 have just re-spent the lanes along it.
   SmallVector<int64_t> instData(srcRank);
-  for (int i = 0; i < srcRank; ++i)
+  for (int i = 0; i < srcRank; ++i) {
     instData[i] = laneLayout[i] * laneData[i];
+    if (isReduced(i) || parentInstData.empty())
+      continue;
+    // Grow only to a whole number of lane footprints that the source holds a
+    // whole number of. Rule 1 may have shrunk the footprint below the parent's.
+    int64_t wider = parentInstData[i];
+    if (wider > instData[i] && wider % instData[i] == 0 &&
+        srcShape[i] % wider == 0)
+      instData[i] = wider;
+  }
 
   return {laneLayout, laneData, instData};
 }
