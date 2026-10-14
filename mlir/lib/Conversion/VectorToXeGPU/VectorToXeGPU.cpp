@@ -1317,14 +1317,105 @@ struct UnflattenGatherScatter : public OpRewritePattern<OpTy> {
   }
 };
 
-// Un-flatten every gather/scatter that was flattened to 1-D operands, so that
-// the conversion patterns and the XeGPU layouts downstream of them see the N-D
-// shape of the accessed data.
-static LogicalResult unflattenGatherScatter(Operation *root) {
+// Rewrite a broadcast that is immediately transposed into a shape_cast that
+// inserts the new dims where they finally belong, followed by a broadcast that
+// stretches them in place.
+//
+// vector.broadcast only ever prepends dims, so laying a lower-rank value out
+// along the *outer* dims of the result takes a transpose. That transpose is
+// real data movement, and the value feeding it carries a layout of its own --
+// one whose lane and inst mapping is the transpose of what every consumer
+// wants, which the XeGPU layout propagation then has to reconcile. Stretching
+// in-place unit dims costs neither: shape_cast leaves the register layout
+// alone, and the broadcast grows dims that already sit in their final
+// position.
+//
+// Before:
+//   %b = vector.broadcast %v : vector<16xf32> to vector<64x16xf32>
+//   %t = vector.transpose %b, [1, 0] : vector<64x16xf32> to vector<16x64xf32>
+//
+// After:
+//   %c = vector.shape_cast %v : vector<16xf32> to vector<16x1xf32>
+//   %t = vector.broadcast %c : vector<16x1xf32> to vector<16x64xf32>
+//
+// This complements the upstream `FoldTransposeBroadcast` canonicalization,
+// which drops the transpose only when the result is reachable by broadcasting
+// the source directly. It is not, here: broadcast duplicates over leading dims
+// and stretches only where the source holds a unit dim, so vector<16xf32> can
+// never become vector<16x64xf32> on its own. The shape_cast supplies the unit
+// dim that makes it reachable.
+struct TransposedBroadcastToStretch
+    : public OpRewritePattern<vector::TransposeOp> {
+  using OpRewritePattern<vector::TransposeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransposeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto bcast = op.getVector().getDefiningOp<vector::BroadcastOp>();
+    if (!bcast)
+      return rewriter.notifyMatchFailure(op, "not transposing a broadcast");
+
+    // A scalar source has no dims to keep in place; broadcasting it straight to
+    // the transposed shape is a separate (and simpler) rewrite.
+    auto srcTy = dyn_cast<VectorType>(bcast.getSourceType());
+    if (!srcTy || srcTy.getRank() < 1)
+      return rewriter.notifyMatchFailure(op, "broadcast source is not a vector");
+
+    VectorType bcastTy = bcast.getResultVectorType();
+    if (srcTy.isScalable() || bcastTy.isScalable())
+      return rewriter.notifyMatchFailure(op, "scalable vectors");
+
+    int64_t srcRank = srcTy.getRank();
+    int64_t numNewDims = bcastTy.getRank() - srcRank;
+    if (numNewDims < 1)
+      return rewriter.notifyMatchFailure(op, "broadcast adds no dims");
+
+    // Only a pure prepend. A dim the broadcast stretched in place cannot be
+    // re-created by a shape_cast, because the source does not hold a unit dim
+    // there to stretch a second time.
+    if (srcTy.getShape() != bcastTy.getShape().take_back(srcRank))
+      return rewriter.notifyMatchFailure(op, "broadcast stretches a source dim");
+
+    // The permutation has to move the source's dims to the front in order and
+    // leave the prepended ones trailing in order. Under any other permutation
+    // the source's own dims get shuffled too, which is real data movement that
+    // this rewrite cannot remove.
+    ArrayRef<int64_t> perm = op.getPermutation();
+    for (int64_t i = 0; i < srcRank; ++i)
+      if (perm[i] != numNewDims + i)
+        return rewriter.notifyMatchFailure(
+            op, "source dims do not move to the front in order");
+    for (int64_t i = 0; i < numNewDims; ++i)
+      if (perm[srcRank + i] != i)
+        return rewriter.notifyMatchFailure(
+            op, "broadcast dims do not stay trailing in order");
+
+    // The source shape with the broadcast dims re-inserted as unit dims, now
+    // on the inside, where the transpose was putting them.
+    SmallVector<int64_t> castShape(srcTy.getShape());
+    castShape.append(numNewDims, 1);
+    auto castTy = VectorType::get(castShape, srcTy.getElementType());
+
+    DictionaryAttr attrs = op->getDiscardableAttrDictionary();
+    auto cast = vector::ShapeCastOp::create(rewriter, op.getLoc(), castTy,
+                                            bcast.getSource());
+    auto stretch = rewriter.replaceOpWithNewOp<vector::BroadcastOp>(
+        op, op.getResultVectorType(), cast);
+    stretch->setDiscardableAttrs(attrs);
+    return success();
+  }
+};
+
+// Normalize vector IR into the shapes the conversion patterns below and the
+// XeGPU layouts downstream of them are expressed in: un-flatten gather/scatter
+// operands that were flattened to 1-D, and turn transposed broadcasts into
+// in-place stretches. Neither rewrite invents a shape; both only undo a
+// framing that hides the shape of the data being moved.
+static LogicalResult preprocessVectorOps(Operation *root) {
   MLIRContext *ctx = root->getContext();
   RewritePatternSet patterns(ctx);
   patterns.add<UnflattenGatherScatter<vector::GatherOp>,
-               UnflattenGatherScatter<vector::ScatterOp>>(ctx);
+               UnflattenGatherScatter<vector::ScatterOp>,
+               TransposedBroadcastToStretch>(ctx);
   vector::ShapeCastOp::getCanonicalizationPatterns(patterns, ctx);
   return applyPatternsGreedily(root, std::move(patterns));
 }
@@ -1409,9 +1500,9 @@ struct ConvertVectorToXeGPUPass
     // load_matrix/store_matrix lowerings have well-typed memref operands.
     promoteAllocasToSLM(getOperation());
 
-    // Undo any flattening of gather/scatter operands, so that the conversion
-    // below sees the N-D shape the XeGPU layouts are expressed in.
-    if (failed(unflattenGatherScatter(getOperation())))
+    // Normalize vector shapes, so that the conversion below sees the shapes
+    // the XeGPU layouts are expressed in.
+    if (failed(preprocessVectorOps(getOperation())))
       return signalPassFailure();
 
     RewritePatternSet patterns(&getContext());
